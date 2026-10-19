@@ -29,12 +29,19 @@ jobs:
         with:
           persist-credentials: false
 
+      # packages/typescript is empty until the first Copybara import from useblacksmith/web.
+      - id: package
+        run: test -f package.json && echo "present=true" >> "$GITHUB_OUTPUT" || echo "present=false" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-node@v6
+        if: steps.package.outputs.present == 'true'
         with:
           node-version: "24"
 
-      - run: npm install --no-audit --no-fund
-      - run: npm run build
-      - run: npm run check:types
-      - run: npm run check:lint
-      - run: npm test
+      - if: steps.package.outputs.present == 'true'
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+          npm run check:types
+          npm run check:lint
+          npm test
