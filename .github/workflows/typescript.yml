@@ -1,0 +1,40 @@
+name: TypeScript SDK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/typescript.yml"
+      - "packages/typescript/**"
+  pull_request:
+    paths:
+      - ".github/workflows/typescript.yml"
+      - "packages/typescript/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    defaults:
+      run:
+        working-directory: packages/typescript
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - run: npm install --no-audit --no-fund
+      - run: npm run build
+      - run: npm run check:types
+      - run: npm run check:lint
+      - run: npm test
