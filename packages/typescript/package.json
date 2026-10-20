@@ -1,0 +1,37 @@
+{
+  "name": "@useblacksmith/sandbox",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for Blacksmith sandboxes (host-agent HTTP API + provisional control plane)",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist",
+    "spec"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "check:types": "tsc --noEmit",
+    "check:lint": "oxlint --type-aware .",
+    "fix:lint": "oxlint --type-aware . --fix",
+    "test": "vitest run",
+    "test:watch": "vitest --watch",
+    "generate": "openapi-ts"
+  },
+  "devDependencies": {
+    "@hey-api/openapi-ts": "0.90.10",
+    "@types/node": "22.20.2",
+    "oxlint": "1.60.0",
+    "oxlint-tsgolint": "0.21.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11"
+  }
+}

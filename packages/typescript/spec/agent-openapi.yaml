@@ -1,0 +1,1181 @@
+openapi: 3.1.0
+info:
+  title: Blacksmith Sandbox API
+  version: 1.0.0
+  summary: Per-sandbox HTTP API served by the Blacksmith sandbox host.
+  description: |
+    Each sandbox is addressed by its own hostname. Clients reach it at
+    `https://<sandbox_id>.<sandbox-domain>/v1/...`; the hostname identifies
+    the sandbox, so the sandbox identity is never part of the URL path.
+
+    Conventions:
+    * JSON request/response bodies for unary operations.
+    * `application/x-ndjson` server->client streams for process output.
+    * Every response carries an `X-Request-Id` header. Clients may supply
+      their own `X-Request-Id`; otherwise the server generates one.
+    * Errors use the `Error` envelope with a stable snake_case `code`.
+
+    Authentication: every operation except `GET /health` requires
+    `Authorization: Bearer <JWT>`, where the JWT is minted by the Blacksmith
+    control plane and verified offline by the sandbox host (see `bearerAuth`).
+    The wire format of the token is described in `README.md` next to this file.
+  license:
+    name: Proprietary
+servers:
+  - url: https://{sandbox_id}.{sandbox_domain}/v1
+    description: |
+      The sandbox domain is deployment configuration and is returned by the
+      control plane together with the sandbox id.
+    variables:
+      sandbox_id:
+        default: sbx-example
+        description: |
+          Hostname label identifying the sandbox: `^[a-z0-9]([a-z0-9-]{0,55}[a-z0-9])?$`.
+      sandbox_domain:
+        default: sandbox.example.invalid
+        description: Parent domain under which sandboxes are addressed.
+tags:
+  - name: meta
+    description: Health.
+  - name: processes
+    description: |
+      The single execution primitive. A process is identified by a
+      client-chosen id (`PUT /processes/{id}`, idempotent). Output is captured
+      outside the sandbox in bounded ring buffers (default 10 MiB per stream
+      and 256 MiB per sandbox, deployment configurable); it survives client
+      disconnects and remains readable after exit until the process is deleted
+      or the sandbox is torn down. When the sandbox-wide bound is reached the
+      least recently written streams lose their oldest bytes first, which
+      readers see as `truncated` / a gap exactly like the per-stream bound.
+      `POST /exec` is synchronous sugar over the same primitive.
+  - name: fs
+    description: |
+      Whole-file transfer. Bodies stream between the client and the sandbox;
+      the file is never buffered in between.
+  - name: ports
+    description: |
+      Public hostnames for guest TCP ports. `PUT /ports/{port}` gives the
+      port a stable hostname `port-<port>-<rand>-<sandbox_id>.<sandbox_domain>`
+      (one label under the sandbox domain, so the sandbox wildcard
+      certificate covers it) on which the host terminates TLS and
+      reverse-proxies HTTP/1.1, WebSocket upgrades and streaming responses
+      to the port inside the VM. Traffic on an exposure hostname is
+      unauthenticated: the hostname's random component (8 lowercase
+      letters) is the only secret. Exposures are recorded on the sandbox's boot disk, so they
+      survive pause/resume and come back when the sandbox does.
+  - name: disks
+    description: |
+      Sticky disks attached to the running VM. The VM boots with a
+      host-configured number of empty block-device slots; `POST /disks`
+      serves a sticky disk entity on a free slot and the guest sees it as a
+      block device at `device`. Nothing is formatted or mounted on the
+      caller's behalf. Attachments last for the current VM only: pause,
+      resume or a crash drop them, and `DELETE` only stops the drive (the
+      slot stays taken until the VM stops). Callers are the control plane,
+      not sandbox users: the entity-scoped storage token in the request is
+      the authorization for the entity.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [meta]
+      operationId: getHealth
+      summary: Liveness of the sandbox.
+      description: |
+        Unauthenticated. Returns 200 only when the sandbox is reachable and
+        able to run processes; 503 `unavailable` otherwise.
+      security: []
+      responses:
+        "200":
+          description: Sandbox reachable.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
+  /exec:
+    post:
+      tags: [processes]
+      operationId: exec
+      summary: Run a command to completion and return its output.
+      description: |
+        Synchronous sugar over the process primitive: starts a process, waits
+        for it to exit or for `timeout_seconds` to elapse (default and maximum
+        are deployment configured; default 300s), then returns exit status and
+        captured output. On timeout the process group is killed and the
+        response has `timed_out: true` with whatever output was captured.
+
+        `stdout`/`stderr` are returned as JSON strings; bytes that are not
+        valid UTF-8 are replaced with U+FFFD. Clients needing the exact bytes
+        should create a process and read `/processes/{id}/output` instead.
+        The process is not retained after this call returns.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecRequest"
+      responses:
+        "200":
+          description: Process finished (or timed out).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExecResponse"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
+  /processes:
+    get:
+      tags: [processes]
+      operationId: listProcesses
+      summary: List processes known to this sandbox.
+      responses:
+        "200":
+          description: OK
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProcessList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /processes/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ProcessId"
+    put:
+      tags: [processes]
+      operationId: putProcess
+      summary: Start a process with a client-chosen id (idempotent).
+      description: |
+        Retry-safe creation. If no process with this id exists, it is started
+        and 201 is returned. If one exists and the submitted spec is
+        semantically equal to the stored spec, the existing process is
+        returned with 200 regardless of its state. If one exists with a
+        different spec, 409 `conflict` is returned and nothing is started.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProcessSpec"
+      responses:
+        "200":
+          description: Existing process with an equal spec.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Process"
+        "201":
+          description: Process started.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Process"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    get:
+      tags: [processes]
+      operationId: getProcess
+      summary: Get process status.
+      responses:
+        "200":
+          description: OK
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Process"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [processes]
+      operationId: deleteProcess
+      summary: Kill the process (if running) and forget it and its output.
+      responses:
+        "204":
+          description: Deleted.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /processes/{id}/output:
+    get:
+      tags: [processes]
+      operationId: getProcessOutput
+      summary: Read captured output as NDJSON.
+      description: |
+        Streams `OutputEvent` objects, one per line. Each stream (stdout,
+        stderr) has its own monotonically increasing byte offset starting at
+        0 when the process starts. `stdout_from` / `stderr_from` select where
+        to resume; the server begins at the requested offset or, if those
+        bytes have been evicted from the ring buffer, at the oldest retained
+        byte after first emitting a `gap` event.
+
+        Without `follow`, the response ends after the retained output (and the
+        `exit` event if the process has finished). With `follow=true`, the
+        response stays open, emitting output as it is produced, and ends with
+        the `exit` event.
+      parameters:
+        - $ref: "#/components/parameters/ProcessId"
+        - name: stream
+          in: query
+          description: Restrict to a single stream.
+          schema:
+            type: string
+            enum: [stdout, stderr, both]
+            default: both
+        - name: stdout_from
+          in: query
+          description: Byte offset in stdout to start from.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+        - name: stderr_from
+          in: query
+          description: Byte offset in stderr to start from.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+            default: 0
+        - name: follow
+          in: query
+          description: Keep the response open until the process exits.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        "200":
+          description: NDJSON stream of `OutputEvent`.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: "#/components/schemas/OutputEvent"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /fs/file:
+    get:
+      tags: [fs]
+      operationId: downloadFile
+      summary: Download a file.
+      description: |
+        Streams the file body as `application/octet-stream` with
+        `Last-Modified`, `X-File-Mode` and `X-File-Size` set from the file's
+        stat in the sandbox. The body is chunked and runs to the file's end-of-file, which
+        may differ from `X-File-Size` for special files such as those under
+        `/proc`; a transfer cut short ends in a truncated chunked body.
+        Anything other than a regular file (directories, devices, FIFOs)
+        yields 400 `invalid_argument`. A sandbox filesystem or quota that
+        cannot serve the read yields 507 `insufficient_storage`; a sandbox
+        momentarily out of some other resource (file descriptors) yields 503
+        `unavailable`. A whole transfer must complete within
+        the deployment's transfer timeout (default 30 minutes); a download that
+        exceeds it before headers are sent yields 504 `timeout`, one that
+        exceeds it mid-body ends in a truncated chunked body.
+      parameters:
+        - $ref: "#/components/parameters/Path"
+      responses:
+        "200":
+          description: File body.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+            Last-Modified:
+              schema:
+                type: string
+            X-File-Mode:
+              description: Octal permission bits of the file (e.g. `0644`).
+              schema:
+                type: string
+            X-File-Size:
+              description: Size reported by stat; advisory, see above.
+              schema:
+                type: integer
+                format: int64
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+        "504":
+          $ref: "#/components/responses/Timeout"
+        "507":
+          description: The sandbox filesystem or quota cannot serve the read (`insufficient_storage`).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    put:
+      tags: [fs]
+      operationId: uploadFile
+      summary: Upload (create or replace) a file.
+      description: |
+        The request body is streamed into the sandbox as a temporary sibling
+        file that replaces the target atomically once complete, so readers
+        never observe a partial file and a failed upload leaves the target
+        untouched. Existing regular files keep their owner and mode; new
+        files get `mode` and are owned by the sandbox default user. Symlinks
+        are followed like `open(2)`: a link at `path` is left in place and
+        its target is replaced (or created, for a dangling link). A target
+        that exists but is not a regular file yields 409 `conflict`. The
+        whole upload must complete within the deployment's transfer timeout
+        (default 30 minutes); a body that stalls past it yields 504
+        `timeout` and the target is left untouched. A sandbox disk or quota
+        with no room for the file yields 507 `insufficient_storage`, again
+        with the target untouched; a sandbox momentarily out of some other
+        resource (file descriptors) yields 503 `unavailable`.
+      parameters:
+        - $ref: "#/components/parameters/Path"
+        - name: mode
+          in: query
+          description: Octal permission bits for a newly created file.
+          schema:
+            type: string
+            pattern: "^0?[0-7]{3,4}$"
+            default: "0644"
+        - name: mkdir_parents
+          in: query
+          description: Create missing parent directories.
+          schema:
+            type: boolean
+            default: false
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+      responses:
+        "200":
+          description: File written.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileInfo"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          description: A parent directory does not exist and `mkdir_parents` is false (`not_found`).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+        "504":
+          $ref: "#/components/responses/Timeout"
+        "507":
+          description: The sandbox filesystem has no room for the file (`insufficient_storage`).
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /disks:
+    get:
+      tags: [disks]
+      operationId: listDisks
+      summary: List attached sticky disks.
+      description: |
+        Every disk attached to the current VM, detached ones included,
+        ordered by slot.
+      responses:
+        "200":
+          description: OK
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DiskList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    post:
+      tags: [disks]
+      operationId: attachDisk
+      summary: Attach a sticky disk entity to a free slot (idempotent per entity).
+      description: |
+        Serves the entity on the lowest free slot and makes the guest
+        re-read the drive, so `device` appears with the entity's capacity
+        without a reboot. The first call for an entity returns 201; later
+        calls return 200 with the same attachment while it is attached. 409
+        `conflict` when every slot is taken, an attach of the same entity
+        is still in flight, another disk operation on this sandbox is still
+        running in the guest, or the sandbox did not boot from a storage-agent
+        disk, 403 `forbidden` when the storage agent rejects the entity
+        token for the entity, 404 `not_found` when the storage agent does
+        not know the entity, 503 `unavailable` on a host without sticky
+        disk support.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DiskAttachRequest"
+      responses:
+        "200":
+          description: The entity was already attached.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Disk"
+        "201":
+          description: Disk attached.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Disk"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+        "504":
+          $ref: "#/components/responses/Timeout"
+
+  /disks/{slot}:
+    parameters:
+      - $ref: "#/components/parameters/Slot"
+    delete:
+      tags: [disks]
+      operationId: detachDisk
+      summary: Detach the sticky disk at a slot.
+      description: |
+        Fails the drive: guest I/O on `device` errors from here on. The
+        disk is unmounted first, by device, whether or not the host
+        recorded a mount (a disk that is not mounted is skipped; one with
+        another filesystem mounted over it is left alone). The slot is
+        not reusable until the VM
+        stops. Idempotent. 404 `not_found` if nothing is attached at the
+        slot; 409 `conflict` if the unmount is refused or another disk
+        operation on this sandbox is still running.
+      responses:
+        "200":
+          description: Disk detached.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Disk"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
+  /ports:
+    get:
+      tags: [ports]
+      operationId: listPorts
+      summary: List exposed ports.
+      responses:
+        "200":
+          description: OK
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PortExposureList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
+  /ports/{port}:
+    parameters:
+      - $ref: "#/components/parameters/Port"
+    put:
+      tags: [ports]
+      operationId: exposePort
+      summary: Expose a guest TCP port on a public hostname (idempotent).
+      description: |
+        Records the port as exposed on the sandbox's boot disk and binds its
+        hostname on the host. The first call for a port returns 201 with a
+        freshly generated hostname; later calls return 200 with the same
+        hostname, `rand` and `created_at`, so a client may call it freely.
+        Nothing checks that something listens on the port: requests to the
+        hostname get 502 until it does. The sandbox shim's own port cannot
+        be exposed (400 `invalid_argument`), and at most 32 ports may be
+        exposed at once (409 `conflict`).
+      responses:
+        "200":
+          description: The port was already exposed.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PortExposure"
+        "201":
+          description: Port exposed.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PortExposure"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    delete:
+      tags: [ports]
+      operationId: unexposePort
+      summary: Stop exposing a port.
+      description: |
+        Removes the record from the boot disk and unbinds the hostname;
+        connections already proxied are left to finish. 404 `not_found` if
+        the port is not exposed.
+      responses:
+        "204":
+          description: Port no longer exposed.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/X-Request-Id"
+        "400":
+          $ref: "#/components/responses/InvalidArgument"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Control-plane minted JWT, verified offline by the sandbox host:
+        * `alg` must be `EdDSA` or `RS256`; `kid` selects the public key from
+          the control plane's published keyset.
+        * `iss` must be `blacksmith-backend`.
+        * `sub` must equal the sandbox id in the hostname the request
+          arrived on.
+        * `exp` is required and enforced with 60 seconds of leeway. Tokens
+          carry `iat` and are minted with `exp <= iat + 3600`; the sandbox
+          does not cap the lifetime itself and has no revocation list, so
+          a leaked token is valid until `exp`.
+        * `abil` (array of strings) must contain `sandbox`.
+        Organisation API keys are never accepted.
+
+  headers:
+    X-Request-Id:
+      description: Correlation id echoed from the request or generated by the server.
+      schema:
+        type: string
+
+  parameters:
+    ProcessId:
+      name: id
+      in: path
+      required: true
+      description: |
+        Process id. Client-chosen ids must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`.
+      schema:
+        type: string
+        pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    Port:
+      name: port
+      in: path
+      required: true
+      description: Guest TCP port, 1..65535.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 65535
+    Slot:
+      name: slot
+      in: path
+      required: true
+      description: Drive slot of an attached disk, as returned by `POST /disks`.
+      schema:
+        type: integer
+        minimum: 2
+        maximum: 11
+    Path:
+      name: path
+      in: query
+      required: true
+      description: |
+        Absolute path inside the sandbox, resolved by the sandbox kernel as
+        given: `..` after a symlink names the parent of the link's target,
+        and a trailing `/` requires a directory.
+      schema:
+        type: string
+        minLength: 1
+
+  responses:
+    InvalidArgument:
+      description: Malformed request (`invalid_argument`).
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RequestTimeout:
+      description: |
+        The request body was not delivered within the server's body deadline
+        (`timeout`). Nothing was started; on HTTP/1.1 the connection is
+        closed.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid token (`unauthorized`, `token_expired`).
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+        WWW-Authenticate:
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Token is valid but not for this sandbox or this ability (`forbidden`).
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: No such process (`not_found`).
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: State conflict (`conflict`).
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Timeout:
+      description: The operation exceeded its deadline (`timeout`).
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unavailable:
+      description: The sandbox is not reachable (`unavailable`).
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/X-Request-Id"
+        Retry-After:
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorBody"
+    ErrorBody:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          $ref: "#/components/schemas/ErrorCode"
+        message:
+          type: string
+          description: Human-readable, not stable.
+        details:
+          type: object
+          additionalProperties: true
+          description: Optional machine-readable context (e.g. `existing_spec` on `conflict`).
+    ErrorCode:
+      type: string
+      description: |
+        Stable error codes and their HTTP status:
+        * `unauthorized` (401) missing/malformed/invalid-signature token
+        * `token_expired` (401) token past `exp` (plus leeway)
+        * `forbidden` (403) `sub` mismatch or missing ability
+        * `not_found` (404)
+        * `conflict` (409) idempotency mismatch, process already exited, ...
+        * `invalid_argument` (400)
+        * `timeout` (504) a synchronous operation exceeded its deadline;
+          (408) the request body was not delivered in time
+        * `unavailable` (503) sandbox not reachable, or momentarily out of
+          a resource other than disk space; retry
+        * `insufficient_storage` (507) the sandbox filesystem has no room
+          for an uploaded file
+        * `internal` (500)
+      enum:
+        - unauthorized
+        - token_expired
+        - forbidden
+        - not_found
+        - conflict
+        - invalid_argument
+        - timeout
+        - unavailable
+        - insufficient_storage
+        - internal
+
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    ProcessSpec:
+      type: object
+      description: |
+        Exactly one of `cmd` or `shell` must be set. Two specs are equal for
+        idempotency purposes when all fields are equal after defaults are
+        applied (`env` to `{}`, an omitted `timeout_seconds` to 0).
+        Processes run as the sandbox's default user (`runner`) with stdin
+        closed.
+      properties:
+        cmd:
+          type: array
+          description: argv; `cmd[0]` is resolved against PATH in the sandbox.
+          items:
+            type: string
+          minItems: 1
+        shell:
+          type: string
+          description: Script run via `/bin/sh -c`.
+        cwd:
+          type: string
+          description: Absolute working directory; defaults to the user's home.
+        env:
+          type: object
+          additionalProperties:
+            type: string
+          description: Environment overlaid on a minimal baseline (HOME, USER, LOGNAME, SHELL, PATH).
+        timeout_seconds:
+          type: integer
+          minimum: 0
+          maximum: 31622400
+          description: |
+            Kill the process group after this many seconds. `0` means no
+            limit (subject to the deployment maximum). When omitted, processes get
+            no limit and `/exec` uses the deployment-configured default (300s); see
+            `ExecRequest`. Values above the maximum (366 days) are rejected
+            by `/processes` and treated as `0` by `/exec`.
+
+    ProcessState:
+      type: string
+      description: |
+        `running`: started and not yet exited. `exited`: finished (see
+        `exit_code`/`signal`). `killed`: terminated by the sandbox host
+        (timeout or DELETE). `lost`: the sandbox host lost track of the
+        process (e.g. across a restart) and its status is unknown.
+      enum: [running, exited, killed, lost]
+
+    OutputStreamStats:
+      type: object
+      required: [total_bytes, retained_from, truncated]
+      properties:
+        total_bytes:
+          type: integer
+          format: int64
+          description: Bytes produced so far; also the next offset.
+        retained_from:
+          type: integer
+          format: int64
+          description: Oldest offset still readable from the ring buffer.
+        truncated:
+          type: boolean
+          description: True once bytes have been evicted (`retained_from > 0`).
+
+    Process:
+      type: object
+      required: [id, state, spec, created_at, stdout, stderr]
+      properties:
+        id:
+          type: string
+        state:
+          $ref: "#/components/schemas/ProcessState"
+        spec:
+          $ref: "#/components/schemas/ProcessSpec"
+        pid:
+          type: integer
+          format: int64
+          description: Pid inside the sandbox.
+        exit_code:
+          type: integer
+          description: Present when `state` is `exited` or `killed`. 128+signal when signaled.
+        signal:
+          type: string
+          description: Terminating signal name (e.g. `SIGKILL`) when the process was signaled.
+        timed_out:
+          type: boolean
+          description: True when the process was killed for exceeding `timeout_seconds`.
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        stdout:
+          $ref: "#/components/schemas/OutputStreamStats"
+        stderr:
+          $ref: "#/components/schemas/OutputStreamStats"
+
+    ProcessList:
+      type: object
+      required: [processes]
+      properties:
+        processes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Process"
+
+    ExecRequest:
+      allOf:
+        - $ref: "#/components/schemas/ProcessSpec"
+      description: |
+        Same fields as `ProcessSpec`. An omitted `timeout_seconds` means the
+        deployment-configured exec default (300s), not "no limit"; send an
+        explicit `0` to run without a limit (still capped by the deployment
+        maximum).
+
+    ExecResponse:
+      type: object
+      required: [stdout, stderr, truncated, timed_out, duration_ms]
+      properties:
+        exit_code:
+          type: integer
+          description: |
+            Present when the sandbox observed the process exit. Absent only
+            when `timed_out` is true and the process had not yet been seen
+            to exit when the response was due: the kill is under way and the
+            process is never reachable again, but its exit status is
+            unknown. 128+signal when signaled.
+        signal:
+          type: string
+        stdout:
+          type: string
+        stderr:
+          type: string
+        truncated:
+          type: boolean
+          description: True if either stream lost bytes to the ring buffer limit.
+        timed_out:
+          type: boolean
+        duration_ms:
+          type: integer
+          format: int64
+
+    OutputEvent:
+      type: object
+      description: |
+        One line of the NDJSON output stream. Discriminated by `type`:
+        * `stdout` / `stderr`: `offset` is the byte offset of the first byte
+          of `data` in that stream; `data` is base64.
+        * `gap`: bytes `[from, to)` of `stream` are unavailable: they were
+          evicted from the retention window or lost between the sandbox
+          host and the guest; the next data event for that stream starts
+          at `to`.
+        * `exit`: terminal event; `state` is `exited`, `killed` or `lost`.
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [stdout, stderr, gap, exit]
+        offset:
+          type: integer
+          format: int64
+        data:
+          type: string
+          contentEncoding: base64
+        stream:
+          type: string
+          enum: [stdout, stderr]
+        from:
+          type: integer
+          format: int64
+        to:
+          type: integer
+          format: int64
+        state:
+          $ref: "#/components/schemas/ProcessState"
+        exit_code:
+          type: integer
+        signal:
+          type: string
+        timed_out:
+          type: boolean
+
+    PortExposure:
+      type: object
+      required: [port, rand, hostname, url, created_at]
+      properties:
+        port:
+          type: integer
+          description: Guest TCP port.
+        rand:
+          type: string
+          description: |
+            Random hostname component (8 lowercase letters), fixed when
+            the port is first exposed.
+        hostname:
+          type: string
+          description: |
+            `port-<port>-<rand>-<sandbox_id>.<sandbox_domain>`; its DNS
+            record follows the sandbox's own.
+        url:
+          type: string
+          format: uri
+          description: "`https://<hostname>`."
+        created_at:
+          type: string
+          format: date-time
+    PortExposureList:
+      type: object
+      required: [ports]
+      properties:
+        ports:
+          type: array
+          description: Ordered by port.
+          items:
+            $ref: "#/components/schemas/PortExposure"
+
+    DiskAttachRequest:
+      type: object
+      required: [entity_id, entity_jwt]
+      properties:
+        entity_id:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            The sticky disk entity to attach. It is served from the storage
+            agent the sandbox's boot disk came from, so it must live in the
+            sandbox's region.
+        entity_jwt:
+          type: string
+          description: |
+            Storage-agent token scoped to `entity_id` with the sticky-disk
+            ability. Never echoed back.
+        mount_path:
+          type: string
+          description: |
+            Clean absolute path (no control characters) to mount the disk
+            at inside the sandbox once it is attached. A disk that carries
+            no filesystem is given ext4 first, owned by the sandbox user
+            (nothing written to an entity disk is ever committed). Omitted:
+            the disk is attached as a bare block device. Re-attaching an
+            entity with the path it is already mounted at is a no-op; with
+            a different path, or with a path another disk is mounted at,
+            it is a conflict.
+    Disk:
+      type: object
+      required: [slot, device, entity_id, capacity_gb, attached_at]
+      properties:
+        slot:
+          type: integer
+          description: Drive slot serving the entity, 2..11.
+        device:
+          type: string
+          description: Block device inside the sandbox, `/dev/vdX`.
+        entity_id:
+          type: integer
+          format: int64
+        capacity_gb:
+          type: integer
+          format: int64
+          description: Size the guest sees.
+        attached_at:
+          type: string
+          format: date-time
+        detached_at:
+          type: string
+          format: date-time
+          description: Set once the disk was detached.
+        mount_path:
+          type: string
+          description: Where the disk is mounted inside the sandbox, if it is.
+    DiskList:
+      type: object
+      required: [disks]
+      properties:
+        disks:
+          type: array
+          description: Ordered by slot.
+          items:
+            $ref: "#/components/schemas/Disk"
+
+    FileInfo:
+      type: object
+      required: [path, size, mode, mod_time]
+      properties:
+        path:
+          type: string
+          description: Absolute path inside the sandbox, as requested.
+        size:
+          type: integer
+          format: int64
+        mode:
+          type: string
+          description: Octal permission bits, e.g. `0644`.
+        mod_time:
+          type: string
+          format: date-time
