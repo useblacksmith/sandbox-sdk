@@ -29,7 +29,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # packages/typescript is empty until the first Copybara import from useblacksmith/web.
+      # packages/typescript is empty until the first Copybara import.
       - id: package
         run: test -f package.json && echo "present=true" >> "$GITHUB_OUTPUT" || echo "present=false" >> "$GITHUB_OUTPUT"
 
