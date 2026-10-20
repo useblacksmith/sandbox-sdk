@@ -1,0 +1,47 @@
+name: TypeScript SDK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/typescript.yml"
+      - "packages/typescript/**"
+  pull_request:
+    paths:
+      - ".github/workflows/typescript.yml"
+      - "packages/typescript/**"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    defaults:
+      run:
+        working-directory: packages/typescript
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      # packages/typescript is empty until the first Copybara import from useblacksmith/web.
+      - id: package
+        run: test -f package.json && echo "present=true" >> "$GITHUB_OUTPUT" || echo "present=false" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v6
+        if: steps.package.outputs.present == 'true'
+        with:
+          node-version: "24"
+
+      - if: steps.package.outputs.present == 'true'
+        run: |
+          npm install --no-audit --no-fund
+          npm run build
+          npm run check:types
+          npm run check:lint
+          npm test
