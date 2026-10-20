@@ -5,10 +5,9 @@ microVMs with an HTTP API for running commands, managing long-lived processes,
 streaming their output, moving files, exposing ports and pausing/resuming.
 This repository hosts one SDK per language under `packages/`.
 
-| Language   | Package                                                                  | Path                  | Status  |
-| ---------- | ------------------------------------------------------------------------ | --------------------- | ------- |
+| Language   | Package                                                                          | Path                  | Status  |
+| ---------- | -------------------------------------------------------------------------------- | --------------------- | ------- |
 | TypeScript | [`@useblacksmith/sandbox`](https://www.npmjs.com/package/@useblacksmith/sandbox) | `packages/typescript` | Preview |
-| Python     |                                                                          | `packages/python`     | Planned |
 
 Each package ships its own README with installation, a quickstart and the full
 API reference.
