@@ -75,10 +75,11 @@ adapter so the rest of the library is unaffected. Expect breaking changes before
 Issues and feature requests for any SDK are welcome in this repository's
 [issue tracker](https://github.com/useblacksmith/sandbox-sdk/issues).
 
-`packages/typescript` is mirrored from Blacksmith's internal monorepo on every
-push and is not edited here directly; pull requests against it will be ported
-rather than merged. Everything else in this repository (this README, CI, other
-language packages) is maintained in place.
+`packages/typescript` is mirrored from Blacksmith's internal monorepo: every
+change there arrives as a `copybara/sandbox-sdk` pull request that is reviewed
+and merged here, so it is not edited in this repository directly and pull
+requests against it will be ported rather than merged. Everything else in this
+repository (this README, CI, other language packages) is maintained in place.
 
 ## License
 
