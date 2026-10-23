@@ -42,7 +42,8 @@ export class FakeAgent {
    * `lost-response` handles the request but destroys the socket instead of answering;
    * `cut-body` sends the headers and first body chunk, then destroys the socket;
    * `stall` sends the headers and first body chunk, then holds the socket open silently;
-   * `unavailable` answers 503; `cut-stream` drops an output stream after its first event;
+   * `unavailable` answers 503; `sandbox_paused`, `sandbox_failed` and `sandbox_deleted` answer
+   * as the retired socket of a gone VM does; `cut-stream` drops an output stream after its first event;
    * `garbage-event` emits an NDJSON line that is not an `OutputEvent`; `pass` leaves the
    * request alone (to aim a later fault at the nth request).
    */
@@ -53,6 +54,9 @@ export class FakeAgent {
     | "cut-body"
     | "stall"
     | "unavailable"
+    | "sandbox_paused"
+    | "sandbox_failed"
+    | "sandbox_deleted"
     | "cut-stream"
     | "garbage-event"
   > = [];
@@ -119,6 +123,14 @@ export class FakeAgent {
     }
     if (fault === "unavailable") {
       return sendError(res, 503, "unavailable", "sandbox is starting");
+    }
+    if (fault === "sandbox_paused" || fault === "sandbox_failed" || fault === "sandbox_deleted") {
+      const state = fault.slice("sandbox_".length);
+      return sendError(res, fault === "sandbox_deleted" ? 410 : 409, fault, `sandbox is ${state}`, {
+        state,
+        vm_id: "vm-old",
+        ...(fault === "sandbox_failed" ? { error: "guest unreachable for 95s" } : {}),
+      });
     }
     const cutStream = fault === "cut-stream";
     if (fault === "garbage-event") {

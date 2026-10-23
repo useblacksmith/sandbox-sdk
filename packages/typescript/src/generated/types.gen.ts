@@ -34,12 +34,17 @@ export type ErrorBody = {
  * (408) the request body was not delivered in time
  * * `unavailable` (503) sandbox not reachable, or momentarily out of
  * a resource other than disk space; retry
+ * * `sandbox_failed` (409) the sandbox failed on this host; `details`
+ * carries `state`, `vm_id` and the failure in `error`. Not retryable.
+ * * `sandbox_paused` (409) the sandbox was paused; resume it through
+ * the control plane and re-resolve its hostname
+ * * `sandbox_deleted` (410) the sandbox was deleted
  * * `insufficient_storage` (507) the sandbox filesystem has no room
  * for an uploaded file
  * * `internal` (500)
  *
  */
-export type ErrorCode = 'unauthorized' | 'token_expired' | 'forbidden' | 'not_found' | 'conflict' | 'invalid_argument' | 'timeout' | 'unavailable' | 'insufficient_storage' | 'internal';
+export type ErrorCode = 'unauthorized' | 'token_expired' | 'forbidden' | 'not_found' | 'conflict' | 'invalid_argument' | 'timeout' | 'unavailable' | 'sandbox_failed' | 'sandbox_paused' | 'sandbox_deleted' | 'insufficient_storage' | 'internal';
 
 export type Health = {
     status: 'ok';
