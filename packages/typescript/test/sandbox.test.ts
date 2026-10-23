@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   HttpControlPlaneClient,
   Sandbox,
@@ -8,7 +8,7 @@ import {
   SandboxNotRunningError,
   SandboxTransportError,
 } from "../src/index.js";
-import type { OutputChunk, SandboxOptions } from "../src/index.js";
+import type { OutputChunk, PauseResumeWait, SandboxOptions } from "../src/index.js";
 import { FakeAgent } from "./fake-agent.js";
 import { FakeControlPlane } from "./fake-control-plane.js";
 import { requestUrl } from "./request-url.js";
@@ -509,17 +509,335 @@ describe("transport-error re-check", () => {
     expect(await sandbox.client.listProcesses()).toEqual([]);
   });
 
-  it("surfaces SandboxNotRunningError when the sandbox is paused", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+  it("surfaces SandboxNotRunningError when the sandbox stays paused past the cycle timeout", async () => {
+    const waits: PauseResumeWait[] = [];
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04" },
+      { ...options, pauseResumeTimeoutMs: 400, onPauseResumeWait: (wait) => waits.push(wait) },
+    );
     cp.records.get(sandbox.id)!.status = "paused";
     agent.faults.push("reset", "reset", "reset");
 
+    const started = Date.now();
     const err = await sandbox.exec({ shell: "echo nope" }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(SandboxNotRunningError);
     expect(err).toMatchObject({ id: sandbox.id, state: "paused" });
-    expect((err as SandboxNotRunningError).cause).toBeInstanceOf(SandboxTransportError);
+    expect(String((err as SandboxNotRunningError).cause)).toContain("within 400ms");
     expect(sandbox.state).toBe("paused");
     expect(agent.requests.filter(isExecStart)).toHaveLength(3);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({
+      id: sandbox.id,
+      from: "paused",
+      state: "paused",
+      outcome: "timeout",
+    });
+  });
+
+  it("waits through a pause → resume cycle and replays once the sandbox runs again", async () => {
+    const waits: PauseResumeWait[] = [];
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04" },
+      { ...options, onPauseResumeWait: (wait) => waits.push(wait) },
+    );
+    cp.requests.length = 0;
+    const record = cp.records.get(sandbox.id)!;
+    record.status = "pausing";
+    // The retired socket answers for the old VM; the record walks pausing → paused → resuming → running.
+    agent.faults.push("sandbox_paused", "sandbox_paused");
+    setTimeout(() => (record.status = "paused"), 300);
+    setTimeout(() => (record.status = "resuming"), 600);
+    setTimeout(() => (record.status = "running"), 900);
+
+    expect(await sandbox.listProcesses()).toEqual([]);
+    expect(sandbox.state).toBe("running");
+    expect(
+      cpCalls().filter((c) => c === `GET /api/v1/sandboxes/${sandbox.id}`).length,
+    ).toBeGreaterThanOrEqual(3);
+    expect(agentPaths().at(-1)).toBe("/v1/processes");
+    expect(agentPaths()).toContain("/v1/health");
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ from: "pausing", state: "running", outcome: "running" });
+    expect(waits[0]?.waitedMs).toBeGreaterThanOrEqual(900);
+  });
+
+  it("fails as unreachable when the record runs again but the agent never answers in time", async () => {
+    const waits: PauseResumeWait[] = [];
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04" },
+      { ...options, pauseResumeTimeoutMs: 600, onPauseResumeWait: (wait) => waits.push(wait) },
+    );
+    const record = cp.records.get(sandbox.id)!;
+    record.status = "resuming";
+    agent.faults.push(
+      "sandbox_paused",
+      "sandbox_paused",
+      ...Array<"unavailable">(40).fill("unavailable"),
+    );
+    setTimeout(() => (record.status = "running"), 100);
+
+    const err = await sandbox.listProcesses().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SandboxTransportError);
+    expect(err).not.toBeInstanceOf(SandboxNotRunningError);
+    expect(String(err)).toContain("not reachable within");
+    expect(sandbox.state).toBe("running");
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ from: "resuming", state: "running", outcome: "timeout" });
+  });
+
+  it("polls once more on the deadline itself instead of giving up early", async () => {
+    const waits: PauseResumeWait[] = [];
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04" },
+      { ...options, pauseResumeTimeoutMs: 400, onPauseResumeWait: (wait) => waits.push(wait) },
+    );
+    const record = cp.records.get(sandbox.id)!;
+    record.status = "resuming";
+    agent.faults.push("sandbox_paused", "sandbox_paused");
+    // 250 ms back-off, then the next 500 ms step is clipped to the 150 ms left: seen at 400 ms.
+    setTimeout(() => (record.status = "running"), 320);
+
+    expect(await sandbox.listProcesses()).toEqual([]);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ from: "resuming", state: "running", outcome: "running" });
+  });
+
+  it("stops the wait when the caller's signal fires", async () => {
+    const waits: PauseResumeWait[] = [];
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04" },
+      { ...options, onPauseResumeWait: (wait) => waits.push(wait) },
+    );
+    cp.records.get(sandbox.id)!.status = "resuming";
+    agent.faults.push("sandbox_paused", "sandbox_paused");
+    const controller = new AbortController();
+    const reason = new Error("caller gave up");
+    setTimeout(() => controller.abort(reason), 100);
+
+    const started = Date.now();
+    const err = await sandbox.listProcesses({ signal: controller.signal }).catch((e: unknown) => e);
+    expect(err).toBe(reason);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ from: "resuming", outcome: "aborted" });
+  });
+
+  it("stops waiting for the agent's health when the caller's signal fires", async () => {
+    const waits: PauseResumeWait[] = [];
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04" },
+      { ...options, pauseResumeTimeoutMs: 10_000, onPauseResumeWait: (wait) => waits.push(wait) },
+    );
+    const record = cp.records.get(sandbox.id)!;
+    record.status = "resuming";
+    // The record runs again at 50 ms; the agent on the new host never answers.
+    agent.faults.push(
+      "sandbox_paused",
+      "sandbox_paused",
+      ...Array<"unavailable">(40).fill("unavailable"),
+    );
+    setTimeout(() => (record.status = "running"), 50);
+    const controller = new AbortController();
+    const reason = new Error("caller gave up");
+    setTimeout(() => controller.abort(reason), 400);
+
+    const started = Date.now();
+    const err = await sandbox.listProcesses({ signal: controller.signal }).catch((e: unknown) => e);
+    expect(err).toBe(reason);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ from: "resuming", state: "running", outcome: "aborted" });
+  });
+
+  it("reports a wait the control plane cut short as failed", async () => {
+    const waits: PauseResumeWait[] = [];
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04" },
+      { ...options, onPauseResumeWait: (wait) => waits.push(wait) },
+    );
+    cp.records.get(sandbox.id)!.status = "resuming";
+    agent.faults.push("sandbox_paused", "sandbox_paused");
+    const outage = new SandboxApiError(503, { code: "unavailable", message: "control plane down" });
+    const get = controlPlane.get.bind(controlPlane);
+    let reads = 0;
+    // The recheck's own read sees `resuming`; the wait's first poll meets the outage.
+    const spy = vi.spyOn(controlPlane, "get").mockImplementation(async (id) => {
+      if (++reads === 2) throw outage;
+      return get(id);
+    });
+    try {
+      const err = await sandbox.listProcesses().catch((e: unknown) => e);
+      expect(err).toBe(outage);
+      expect(waits).toHaveLength(1);
+      expect(waits[0]).toMatchObject({ from: "resuming", outcome: "failed" });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("keeps waiting when the sandbox is paused again before its agent answers", async () => {
+    const waits: PauseResumeWait[] = [];
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04" },
+      { ...options, pauseResumeTimeoutMs: 5_000, onPauseResumeWait: (wait) => waits.push(wait) },
+    );
+    const record = cp.records.get(sandbox.id)!;
+    record.status = "resuming";
+    // The call's answer, the recheck's, then the readiness probe meets a VM going down again.
+    agent.faults.push("sandbox_paused", "sandbox_paused", "unavailable");
+    setTimeout(() => (record.status = "running"), 100);
+    setTimeout(() => (record.status = "pausing"), 350);
+    setTimeout(() => (record.status = "paused"), 600);
+    setTimeout(() => (record.status = "running"), 900);
+
+    expect(await sandbox.listProcesses()).toEqual([]);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ from: "resuming", state: "running", outcome: "running" });
+  });
+
+  it("stops waiting when the cycle ends failed", async () => {
+    const waits: PauseResumeWait[] = [];
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04" },
+      { ...options, onPauseResumeWait: (wait) => waits.push(wait) },
+    );
+    const record = cp.records.get(sandbox.id)!;
+    record.status = "resuming";
+    agent.faults.push("sandbox_paused", "sandbox_paused");
+    setTimeout(() => (record.status = "failed"), 300);
+
+    const err = await sandbox.listProcesses().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SandboxNotRunningError);
+    expect(err).toMatchObject({ id: sandbox.id, state: "failed" });
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ from: "resuming", state: "failed", outcome: "not_running" });
+  });
+
+  it("replays once a retired socket's sandbox_paused when the control plane says running", async () => {
+    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    cp.requests.length = 0;
+    // The client redials once on its own; the second answer sends it to the control plane.
+    agent.faults.push("sandbox_paused", "sandbox_paused");
+
+    expect(await sandbox.listProcesses()).toEqual([]);
+    expect(agentPaths().filter((p) => p === "/v1/processes").length).toBe(3);
+    expect(cpCalls()).toEqual([`GET /api/v1/sandboxes/${sandbox.id}`]);
+    expect(sandbox.state).toBe("running");
+  });
+
+  it("does not let a retired socket's sandbox_failed override a running control plane record", async () => {
+    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    cp.requests.length = 0;
+    agent.faults.push("sandbox_failed");
+
+    const result = await sandbox.exec({ shell: "echo once" });
+    expect(result.stdout).toBe("once\n");
+    expect(agent.requests.filter(isExecStart)).toHaveLength(2);
+    expect(cpCalls()).toEqual([`GET /api/v1/sandboxes/${sandbox.id}`]);
+    expect(sandbox.state).toBe("running");
+  });
+
+  it("attaches to the started process when the output read hits a retired socket", async () => {
+    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    cp.requests.length = 0;
+    const marker = join(agent.fsRoot, "sandbox-tombstone-ran-once");
+    agent.faults.push("pass", "sandbox_failed");
+
+    const result = await sandbox.exec({ shell: `echo run >> ${marker}; sleep 0.2; cat ${marker}` });
+    expect(result.stdout).toBe("run\n");
+    expect(await readFile(marker, "utf8")).toBe("run\n");
+    expect(agent.requests.filter(isExecStart)).toHaveLength(2);
+    expect(cpCalls()).toEqual([`GET /api/v1/sandboxes/${sandbox.id}`]);
+  });
+
+  it("gives up after repeated retired-socket answers while the control plane says running", async () => {
+    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    cp.requests.length = 0;
+    agent.faults.push(
+      "sandbox_failed",
+      "sandbox_failed",
+      "sandbox_failed",
+      "sandbox_failed",
+      "sandbox_failed",
+    );
+
+    const err = await sandbox.listProcesses().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SandboxApiError);
+    expect(err).toMatchObject({ code: "sandbox_failed" });
+    expect(agentPaths().filter((p) => p === "/v1/processes").length).toBe(4);
+    expect(cpCalls()).toHaveLength(4);
+    expect(sandbox.state).toBe("running");
+  });
+
+  it("stops waiting for readiness when the sandbox pauses during connect", async () => {
+    const seeded = cp.seed("running");
+    const get = controlPlane.get.bind(controlPlane);
+    const spy = vi.spyOn(controlPlane, "get").mockImplementation(async (id) => {
+      const record = await get(id);
+      cp.records.get(id)!.status = "paused";
+      return record;
+    });
+    try {
+      agent.faults.push("sandbox_paused", "sandbox_paused");
+      const sandbox = await Sandbox.connect(controlPlane, seeded.id, options);
+      expect(sandbox.state).toBe("paused");
+      expect(agentPaths().filter((p) => p === "/v1/health")).toHaveLength(2);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it.each([
+    { fault: "sandbox_paused", state: "paused" },
+    { fault: "sandbox_failed", state: "failed" },
+    { fault: "sandbox_deleted", state: "deleted" },
+  ] as const)(
+    "surfaces SandboxNotRunningError for $fault when the control plane says $state",
+    async ({ fault, state }) => {
+      // `paused` is waited out as a pause → resume cycle first; its cause is the timeout, wrapping the answer.
+      const sandbox = await Sandbox.create(
+        controlPlane,
+        { image: "ubuntu-24.04" },
+        { ...options, pauseResumeTimeoutMs: 300 },
+      );
+      cp.records.get(sandbox.id)!.status = state;
+      agent.faults.push(fault, fault);
+
+      const err = await sandbox.exec({ shell: "echo nope" }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(SandboxNotRunningError);
+      expect(err).toMatchObject({ id: sandbox.id, state });
+      let cause = (err as SandboxNotRunningError).cause;
+      if (state === "paused") cause = (cause as Error).cause;
+      expect(cause).toBeInstanceOf(SandboxApiError);
+      expect(cause).toMatchObject({ code: fault, details: { vm_id: "vm-old" } });
+      expect(sandbox.state).toBe(state);
+    },
+  );
+
+  it("resumes an output stream after a retired socket's answer when the control plane says running", async () => {
+    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const { process } = await sandbox.startProcess("tomb", {
+      shell: "for i in 1 2 3; do echo tick $i; sleep 0.1; done",
+    });
+    cp.requests.length = 0;
+    agent.faults.push("sandbox_failed");
+
+    const chunks: string[] = [];
+    for await (const chunk of sandbox.streamOutput(process.id, { follow: true })) {
+      if (chunk.type === "stdout") chunks.push(new TextDecoder().decode(chunk.data));
+    }
+    expect(chunks.join("")).toBe("tick 1\ntick 2\ntick 3\n");
+    expect(cpCalls()).toEqual([`GET /api/v1/sandboxes/${sandbox.id}`]);
   });
 
   it("rechecks but never replays a streaming upload", async () => {

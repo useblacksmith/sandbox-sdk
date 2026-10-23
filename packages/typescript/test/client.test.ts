@@ -961,6 +961,59 @@ describe("errors and retries", () => {
     ]);
   });
 
+  it("redials once when a retired socket says sandbox_paused", async () => {
+    const requests: Array<{ url: string; keepalive: boolean | undefined }> = [];
+    const c = client({
+      retry: { maxAttempts: 1 },
+      fetch: async (input, init) => {
+        requests.push({ url: requestUrl(input), keepalive: init?.keepalive });
+        if (requests.length === 1) {
+          return Response.json(
+            {
+              error: {
+                code: "sandbox_paused",
+                message: "sandbox is paused",
+                details: { state: "paused", vm_id: "vm-old" },
+              },
+            },
+            { status: 409 },
+          );
+        }
+        return fetch(input, init);
+      },
+    });
+    await expect(c.health()).resolves.toEqual({ status: "ok" });
+    expect(requests).toEqual([
+      { url: `${agent.url}/health`, keepalive: undefined },
+      { url: `${agent.url}/health`, keepalive: false },
+    ]);
+  });
+
+  it("dials afresh once after redial()", async () => {
+    const keepalives: Array<boolean | undefined> = [];
+    const c = client({
+      fetch: async (input, init) => {
+        keepalives.push(init?.keepalive);
+        return fetch(input, init);
+      },
+    });
+    c.redial();
+    await expect(c.health()).resolves.toEqual({ status: "ok" });
+    await expect(c.health()).resolves.toEqual({ status: "ok" });
+    expect(keepalives).toEqual([false, undefined]);
+  });
+
+  it("leaves the process alone when a retired socket answers after the start", async () => {
+    agent.faults.push("pass", "sandbox_failed");
+    const err = await client()
+      .exec({ shell: "sleep 2" }, { processId: "kept" })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SandboxApiError);
+    expect(err).toMatchObject({ code: "sandbox_failed" });
+    expect(agent.requests.filter((r) => r.method === "DELETE")).toHaveLength(0);
+    await client().killProcess("kept");
+  });
+
   it("preserves the process id and body when reconnecting a command start", async () => {
     const requests: Array<{ url: string; body: BodyInit | null | undefined }> = [];
     const c = client({
@@ -992,6 +1045,8 @@ describe("errors and retries", () => {
     { status: 404, code: "not_found", message: "no process missing" },
     { status: 503, code: "not_found", message: "sandbox not found on this host" },
     { status: 404, code: "unavailable", message: "sandbox not found on this host" },
+    { status: 409, code: "sandbox_failed", message: "sandbox is failed" },
+    { status: 410, code: "sandbox_deleted", message: "sandbox is deleted" },
   ])("does not reconnect for other API errors: $status $code $message", async (error) => {
     let calls = 0;
     const c = client({

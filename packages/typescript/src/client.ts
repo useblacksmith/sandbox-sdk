@@ -9,7 +9,7 @@ import type {
   Process,
   ProcessList,
 } from "./generated/types.gen.js";
-import { SandboxApiError, SandboxTransportError } from "./errors.js";
+import { SandboxApiError, SandboxTransportError, isSandboxGone } from "./errors.js";
 import { parseNdjson } from "./ndjson.js";
 import { TokenSource, type TokenProvider } from "./token.js";
 import {
@@ -99,6 +99,7 @@ const DEFAULT_RETRY: Required<RetryOptions> = {
 export class SandboxClient {
   readonly baseUrl: string;
   private readonly tokens: TokenSource;
+  private redialNext = false;
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly timeoutMs: number;
   private readonly retry: Required<RetryOptions>;
@@ -191,7 +192,15 @@ export class SandboxClient {
           deadline.signal.reason,
         );
       }
-      if (error instanceof SandboxTransportError && processId !== undefined) cleanup = false;
+      // The process may still be running: the connection dropped, or the host that
+      // answered no longer runs the sandbox at all. A replay under the same id
+      // attaches to it instead of starting it again.
+      if (
+        (error instanceof SandboxTransportError || isSandboxGone(error)) &&
+        processId !== undefined
+      ) {
+        cleanup = false;
+      }
       throw error;
     } finally {
       deadline.clear();
@@ -486,6 +495,15 @@ export class SandboxClient {
     });
   }
 
+  /**
+   * Makes the next request dial a fresh connection instead of reusing a pooled
+   * one. Call it when the control plane says the sandbox moved (a resume lands
+   * on another host) so the request re-resolves the hostname.
+   */
+  redial(): void {
+    this.redialNext = true;
+  }
+
   private async json<T>(op: Operation): Promise<T> {
     const { body } = await this.send(op);
     return parseJson<T>(body);
@@ -505,7 +523,8 @@ export class SandboxClient {
     const maxAttempts = op.idempotent ? this.retry.maxAttempts : 1;
     let refreshed = false;
     let replayed = false;
-    let reconnected = false;
+    let reconnected = this.redialNext;
+    this.redialNext = false;
 
     for (let attempt = 1; ; attempt++) {
       signal?.throwIfAborted();
@@ -561,12 +580,11 @@ export class SandboxClient {
         response.headers.get("x-request-id") ?? undefined,
       );
       const canReplay = !(op.body instanceof ReadableStream);
-      // The old host rejects a relocated sandbox before dispatching the request.
-      if (
-        apiError.status === 404 &&
-        apiError.code === "not_found" &&
-        apiError.message === "sandbox not found on this host"
-      ) {
+      // The old host rejects a relocated sandbox before dispatching the request:
+      // 404 from a router with no socket for it, 409 `sandbox_paused` from the
+      // socket the agent keeps serving after a pause, which a resume elsewhere
+      // leaves behind. The redial re-resolves the hostname.
+      if (isStaleHost(apiError)) {
         if (!reconnected && canReplay) {
           reconnected = true;
           continue;
@@ -599,6 +617,15 @@ export class SandboxClient {
     }
     return url.toString();
   }
+}
+
+function isStaleHost(error: SandboxApiError): boolean {
+  if (error.code === "sandbox_paused") return true;
+  return (
+    error.status === 404 &&
+    error.code === "not_found" &&
+    error.message === "sandbox not found on this host"
+  );
 }
 
 function resolveBaseUrl(options: SandboxClientOptions): string {
