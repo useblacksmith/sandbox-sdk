@@ -1,6 +1,6 @@
 export { SandboxClient } from "./client.js";
 export type { RetryOptions, SandboxClientOptions } from "./client.js";
-export { SandboxApiError, SandboxError, SandboxTransportError } from "./errors.js";
+export { SandboxApiError, SandboxError, SandboxTransportError, isSandboxGone } from "./errors.js";
 export { ControlPlaneError, HttpControlPlaneClient, concurrencyLimit } from "./control-plane.js";
 export type {
   ConcurrencyLimit,
@@ -19,7 +19,7 @@ export type {
   SandboxState,
 } from "./control-plane.js";
 export { Sandbox, SandboxNotRunningError } from "./sandbox.js";
-export type { SandboxOptions } from "./sandbox.js";
+export type { PauseResumeWait, SandboxOptions } from "./sandbox.js";
 export type { AgentToken, TokenProvider } from "./token.js";
 export type {
   AttachDiskResult,

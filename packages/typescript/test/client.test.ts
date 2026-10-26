@@ -111,9 +111,21 @@ describe("activity", () => {
 });
 
 describe("auth", () => {
-  it("does not send a token to /health", async () => {
+  it("sends the configured token to /health", async () => {
     await expect(client().health()).resolves.toEqual({ status: "ok" });
-    expect(agent.requests[0]?.authorization).toBeNull();
+    expect(agent.requests[0]?.authorization).toBe(`Bearer ${TOKEN}`);
+  });
+
+  it("sends a provider token to /health", async () => {
+    const c = client({
+      token: undefined,
+      tokenProvider: async () => ({
+        token: TOKEN,
+        expiresAt: new Date(Date.now() + 3_600_000),
+      }),
+    });
+    await expect(c.health()).resolves.toEqual({ status: "ok" });
+    expect(agent.requests[0]?.authorization).toBe(`Bearer ${TOKEN}`);
   });
 
   it("sends Bearer <token> on authenticated calls", async () => {
@@ -961,6 +973,70 @@ describe("errors and retries", () => {
     ]);
   });
 
+  it("authenticates health probes so a retired socket can answer sandbox_paused and redial", async () => {
+    const requests: Array<{
+      url: string;
+      keepalive: boolean | undefined;
+      authorization: string | null;
+    }> = [];
+    const c = client({
+      retry: { maxAttempts: 1 },
+      fetch: async (input, init) => {
+        const authorization = new Headers(init?.headers).get("authorization");
+        requests.push({ url: requestUrl(input), keepalive: init?.keepalive, authorization });
+        if (authorization !== `Bearer ${TOKEN}`) {
+          return Response.json(
+            { error: { code: "unauthorized", message: "missing Authorization header" } },
+            { status: 401 },
+          );
+        }
+        if (requests.length === 1) {
+          return Response.json(
+            {
+              error: {
+                code: "sandbox_paused",
+                message: "sandbox is paused",
+                details: { state: "paused", vm_id: "vm-old" },
+              },
+            },
+            { status: 409 },
+          );
+        }
+        return fetch(input, init);
+      },
+    });
+    await expect(c.health()).resolves.toEqual({ status: "ok" });
+    expect(requests).toEqual([
+      { url: `${agent.url}/health`, keepalive: undefined, authorization: `Bearer ${TOKEN}` },
+      { url: `${agent.url}/health`, keepalive: false, authorization: `Bearer ${TOKEN}` },
+    ]);
+  });
+
+  it("dials afresh once after redial()", async () => {
+    const keepalives: Array<boolean | undefined> = [];
+    const c = client({
+      fetch: async (input, init) => {
+        keepalives.push(init?.keepalive);
+        return fetch(input, init);
+      },
+    });
+    c.redial();
+    await expect(c.health()).resolves.toEqual({ status: "ok" });
+    await expect(c.health()).resolves.toEqual({ status: "ok" });
+    expect(keepalives).toEqual([false, undefined]);
+  });
+
+  it("leaves the process alone when a retired socket answers after the start", async () => {
+    agent.faults.push("pass", "sandbox_failed");
+    const err = await client()
+      .exec({ shell: "sleep 2" }, { processId: "kept" })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SandboxApiError);
+    expect(err).toMatchObject({ code: "sandbox_failed" });
+    expect(agent.requests.filter((r) => r.method === "DELETE")).toHaveLength(0);
+    await client().killProcess("kept");
+  });
+
   it("preserves the process id and body when reconnecting a command start", async () => {
     const requests: Array<{ url: string; body: BodyInit | null | undefined }> = [];
     const c = client({
@@ -992,6 +1068,8 @@ describe("errors and retries", () => {
     { status: 404, code: "not_found", message: "no process missing" },
     { status: 503, code: "not_found", message: "sandbox not found on this host" },
     { status: 404, code: "unavailable", message: "sandbox not found on this host" },
+    { status: 409, code: "sandbox_failed", message: "sandbox is failed" },
+    { status: 410, code: "sandbox_deleted", message: "sandbox is deleted" },
   ])("does not reconnect for other API errors: $status $code $message", async (error) => {
     let calls = 0;
     const c = client({
