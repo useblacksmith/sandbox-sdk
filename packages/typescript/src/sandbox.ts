@@ -4,10 +4,12 @@ import {
   newExecProcessId,
   type SandboxClientOptions,
 } from "./client.js";
+import { ControlPlaneError, terminalFailureRecord } from "./control-plane.js";
 import type {
   MintedToken,
   SandboxControlPlane,
   SandboxCreateOptions,
+  SandboxFailure,
   SandboxRecord,
 } from "./control-plane.js";
 import { SandboxApiError, SandboxError, SandboxTransportError, isSandboxGone } from "./errors.js";
@@ -38,11 +40,18 @@ type RecheckCause = SandboxTransportError | SandboxApiError;
 export class SandboxNotRunningError extends SandboxError {
   readonly id: string;
   readonly state: string;
+  readonly lastError: string | SandboxFailure | undefined;
+  readonly code: string | undefined;
 
   constructor(record: SandboxRecord, options?: ErrorOptions) {
-    super(`sandbox ${record.id} is ${record.state}, not running`, options);
+    const failure = record.lastError;
+    const reason = typeof failure === "string" ? failure : failure?.message;
+    const stateMessage = `sandbox ${record.id} is ${record.state}, not running`;
+    super(reason === undefined ? stateMessage : `${stateMessage}: ${reason}`, options);
     this.id = record.id;
     this.state = record.state;
+    this.lastError = failure;
+    this.code = typeof failure === "string" ? undefined : failure?.code;
   }
 }
 
@@ -123,7 +132,14 @@ export class Sandbox {
     createOptions: SandboxCreateOptions,
     options: SandboxOptions = {},
   ): Promise<Sandbox> {
-    const record = await cp.create(createOptions);
+    let record: SandboxRecord;
+    try {
+      record = await cp.create(createOptions);
+    } catch (error) {
+      const failed = terminalFailureRecord(error);
+      if (failed) throw new SandboxNotRunningError(failed, { cause: error });
+      throw error;
+    }
     if (
       createOptions.idleDeleteTimeoutSeconds !== undefined &&
       record.raw.idle_delete_timeout_seconds !== createOptions.idleDeleteTimeoutSeconds
@@ -139,7 +155,10 @@ export class Sandbox {
     } catch (error) {
       // The caller never gets a handle, so a freshly allocated VM would leak. A keyed create
       // may have replayed a record another caller already holds, so leave it alone.
-      if (createOptions.idempotencyKey === undefined) {
+      if (
+        createOptions.idempotencyKey === undefined &&
+        !(error instanceof SandboxNotRunningError && error.state === "failed")
+      ) {
         await cp.delete(record.id).catch(() => undefined);
       }
       throw error;
@@ -162,9 +181,30 @@ export class Sandbox {
     // The control plane still mints tokens for a `deleting` record whose VM is already gone.
     if (isTerminal(record.state)) throw new SandboxNotRunningError(record);
     const tokens = sandboxTokens(cp);
-    const attached = record.token
-      ? tokens.remember(record.id, record.token)
-      : await tokens.reuse(record.id);
+    let attached: SharedToken;
+    try {
+      attached = record.token
+        ? tokens.remember(record.id, record.token)
+        : await tokens.reuse(record.id);
+    } catch (error) {
+      const failed = terminalFailureRecord(error);
+      if (failed) {
+        if (failed.id !== record.id) throw error;
+        throw new SandboxNotRunningError(failed, { cause: error });
+      }
+      if (
+        error instanceof ControlPlaneError &&
+        error.status === 409 &&
+        error.code === "invalid_state" &&
+        error.sandboxStatus === "failed"
+      ) {
+        const refreshed = await cp.get(record.id).catch(() => undefined);
+        if (refreshed && isTerminal(refreshed.state)) {
+          throw new SandboxNotRunningError(refreshed, { cause: error });
+        }
+      }
+      throw error;
+    }
     const toBaseUrl = options.agentBaseUrl ?? ((hostname: string) => `https://${hostname}/v1`);
     const client = new SandboxClient({
       ...options.client,
@@ -184,6 +224,10 @@ export class Sandbox {
     return this.record.state;
   }
 
+  get lastError(): SandboxRecord["lastError"] {
+    return this.record.lastError;
+  }
+
   async refresh(): Promise<SandboxRecord> {
     this.record = await this.cp.get(this.id);
     return this.record;
@@ -195,8 +239,17 @@ export class Sandbox {
   }
 
   async resume(): Promise<SandboxRecord> {
-    this.record = await this.cp.resume(this.id);
-    return this.record;
+    try {
+      this.record = await this.cp.resume(this.id);
+      return this.record;
+    } catch (error) {
+      const failed = terminalFailureRecord(error);
+      if (failed && failed.id === this.id) {
+        this.record = { ...this.record, state: failed.state, lastError: failed.lastError };
+        throw new SandboxNotRunningError(this.record, { cause: error });
+      }
+      throw error;
+    }
   }
 
   async delete(): Promise<SandboxRecord> {

@@ -15,6 +15,7 @@ export type {
   SandboxCreateOptions,
   SandboxCreateSettings,
   SandboxListOptions,
+  SandboxFailure,
   SandboxRecord,
   SandboxState,
 } from "./control-plane.js";

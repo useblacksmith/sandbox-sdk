@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  ControlPlaneError,
   HttpControlPlaneClient,
   Sandbox,
   SandboxApiError,
@@ -46,6 +47,185 @@ const agentPaths = () => agent.requests.map((r) => r.path);
 const cpCalls = () => cp.requests.map((r) => `${r.method} ${r.path}`);
 const isExecStart = (r: { method: string; path: string }) =>
   r.method === "PUT" && r.path.startsWith("/v1/processes/exec-");
+
+describe("terminal control-plane failures", () => {
+  const failure = {
+    source: "placement",
+    code: "capacity_exhausted",
+    message: "No node could place the sandbox",
+    attempts: 3,
+    distinct_nodes: 2,
+    occurred_at: "2026-10-26T00:00:00Z",
+  };
+  const failedResponse = (id: string, lastError: string | null) =>
+    Response.json(
+      {
+        status: "failed",
+        error: {
+          code: "invalid_state",
+          message: failure.message,
+          status: "failed",
+          details: { sandbox_id: id, last_error: lastError },
+        },
+      },
+      { status: 409 },
+    );
+
+  it.each([JSON.stringify(failure), "original plain failure", null])(
+    "turns HTTP create failure into a typed error without deleting: %s",
+    async (lastError) => {
+      const calls: string[] = [];
+      const http = new HttpControlPlaneClient({
+        apiKey: cp.apiKey,
+        baseUrl: cp.url,
+        fetch: async (input, init) => {
+          calls.push(`${init?.method} ${requestUrl(input)}`);
+          return failedResponse("sbx-failed", lastError);
+        },
+      });
+      const create = vi.spyOn(http, "create");
+      const error = await Sandbox.create(http, { image: "ubuntu-24.04" }, options).catch(
+        (error: unknown) => error,
+      );
+      const original = await create.mock.results[0]?.value.catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(SandboxNotRunningError);
+      expect(error).not.toBeInstanceOf(ControlPlaneError);
+      expect(error).toMatchObject({ id: "sbx-failed", state: "failed" });
+      if (!(error instanceof SandboxNotRunningError)) throw error;
+      expect(error.cause).toBe(original);
+      expect(error.cause).toBeInstanceOf(ControlPlaneError);
+      expect(error.cause).toMatchObject({ status: 409, code: "invalid_state" });
+      expect(error.lastError).toEqual(
+        lastError === JSON.stringify(failure)
+          ? {
+              source: failure.source,
+              code: failure.code,
+              message: failure.message,
+              attempts: 3,
+              distinctNodes: 2,
+              occurredAt: failure.occurred_at,
+            }
+          : (lastError ?? failure.message),
+      );
+      expect(error.message).toContain(
+        typeof error.lastError === "string" ? error.lastError : failure.message,
+      );
+      expect(calls).toEqual([`POST ${cp.url}/api/v1/sandboxes`]);
+    },
+  );
+
+  it("preserves a failed sandbox returned by a successful create response", async () => {
+    const calls: string[] = [];
+    const http = new HttpControlPlaneClient({
+      apiKey: cp.apiKey,
+      baseUrl: cp.url,
+      fetch: async (input, init) => {
+        calls.push(`${init?.method} ${requestUrl(input)}`);
+        return Response.json(
+          { id: "sbx-failed", status: "failed", last_error: JSON.stringify(failure) },
+          { status: 201 },
+        );
+      },
+    });
+
+    await expect(Sandbox.create(http, { image: "ubuntu-24.04" }, options)).rejects.toMatchObject({
+      id: "sbx-failed",
+      state: "failed",
+      code: failure.code,
+      lastError: { message: failure.message },
+    });
+    expect(calls).toEqual([`POST ${cp.url}/api/v1/sandboxes`]);
+  });
+
+  it("updates the handle when HTTP resume returns the saved failure", async () => {
+    const record = cp.seed("paused");
+    const http = new HttpControlPlaneClient({
+      apiKey: cp.apiKey,
+      baseUrl: cp.url,
+      fetch: async (input, init) =>
+        requestUrl(input).endsWith("/resume")
+          ? failedResponse(record.id, JSON.stringify(failure))
+          : fetch(input, init),
+    });
+    const sandbox = await Sandbox.connect(http, record.id, options);
+    const error = await sandbox.resume().catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(SandboxNotRunningError);
+    expect(error).toMatchObject({ id: record.id, state: "failed", code: failure.code });
+    if (!(error instanceof SandboxNotRunningError)) throw error;
+    expect(error.cause).toBeInstanceOf(ControlPlaneError);
+    expect(sandbox.state).toBe("failed");
+    expect(sandbox.lastError).toEqual(error.lastError);
+    expect(cpCalls().some((call) => call.startsWith("DELETE"))).toBe(false);
+  });
+
+  it.each([
+    "failed",
+    "detailed",
+    "wrong-id",
+    "unauthorized",
+    "starting",
+    "deleted",
+    "deleting",
+    "wrong-status",
+    "transport",
+    "refresh-fails",
+  ])("rechecks only structured failed mint errors: %s", async (scenario) => {
+    const record = cp.seed();
+    let gets = 0;
+    const http = new HttpControlPlaneClient({
+      apiKey: cp.apiKey,
+      baseUrl: cp.url,
+      fetch: async (input, init) => {
+        if (requestUrl(input).endsWith("/tokens")) {
+          record.status = "failed";
+          if (scenario === "transport") throw new Error("connection reset");
+          if (scenario === "detailed" || scenario === "wrong-id") {
+            return failedResponse(
+              scenario === "wrong-id" ? "sbx-other" : record.id,
+              JSON.stringify(failure),
+            );
+          }
+          return Response.json(
+            {
+              error: {
+                code: scenario === "unauthorized" ? "unauthorized" : "invalid_state",
+                message: "original token error",
+                status: ["starting", "deleted", "deleting"].includes(scenario)
+                  ? scenario
+                  : "failed",
+              },
+            },
+            { status: scenario === "unauthorized" ? 401 : scenario === "wrong-status" ? 500 : 409 },
+          );
+        }
+        gets++;
+        if (gets > 1) {
+          if (scenario === "refresh-fails") throw new Error("refresh unavailable");
+          return Response.json({ ...record, last_error: JSON.stringify(failure) });
+        }
+        return fetch(input, init);
+      },
+    });
+    const mint = vi.spyOn(http, "mintToken");
+    const error = await Sandbox.connect(http, record.id, options).catch((error: unknown) => error);
+    const result = mint.mock.results[0];
+    const original = await result?.value.catch((error: unknown) => error);
+    if (scenario === "failed" || scenario === "detailed") {
+      expect(error).toBeInstanceOf(SandboxNotRunningError);
+      expect(error).toMatchObject({
+        id: record.id,
+        state: "failed",
+        code: failure.code,
+        lastError: { message: failure.message },
+      });
+      if (!(error instanceof SandboxNotRunningError)) throw error;
+      expect(error.cause).toBe(original);
+    } else {
+      expect(error).toBe(original);
+    }
+    expect(gets).toBe(scenario === "failed" || scenario === "refresh-fails" ? 2 : 1);
+  });
+});
 
 describe("Sandbox.create / connect", () => {
   it("creates, uses the token from the create response, waits for health and runs commands", async () => {
@@ -179,6 +359,94 @@ describe("Sandbox.create / connect", () => {
     expect(err).toMatchObject({ id: record.id, state: "failed" });
     expect((err as SandboxNotRunningError).cause).toBeInstanceOf(SandboxTransportError);
     expect(agentPaths()).toEqual(["/v1/health", "/v1/health", "/v1/health"]);
+  });
+
+  it("surfaces the assigner failure after health DNS failure without waiting for the deadline", async () => {
+    const record = cp.seed("starting");
+    const failure = {
+      source: "assigner",
+      code: "placement_attempts_exhausted",
+      message: "placement failed after 3 attempts on 2 nodes",
+      attempts: 3,
+      distinct_nodes: 2,
+      occurred_at: "2026-10-23T10:00:00Z",
+    };
+    const dnsError = Object.assign(new Error("getaddrinfo ENOTFOUND"), { code: "ENOTFOUND" });
+    const failing = new HttpControlPlaneClient({
+      apiKey: cp.apiKey,
+      baseUrl: cp.url,
+      fetch: async (input, init) => {
+        if (record.status === "failed") {
+          return Response.json({ ...record, last_error: JSON.stringify(failure) });
+        }
+        return fetch(input, init);
+      },
+    });
+    const started = Date.now();
+    const error = await Sandbox.connect(failing, record.id, {
+      ...options,
+      readyTimeoutMs: 60_000,
+      client: {
+        retry: { maxAttempts: 1 },
+        fetch: async () => {
+          record.status = "failed";
+          throw dnsError;
+        },
+      },
+    }).catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(SandboxNotRunningError);
+    expect(error).toMatchObject({
+      state: "failed",
+      code: "placement_attempts_exhausted",
+      message: expect.stringContaining(failure.message),
+      lastError: { message: failure.message, attempts: 3, distinctNodes: 2 },
+      cause: expect.any(SandboxTransportError),
+    });
+    if (!(error instanceof SandboxNotRunningError)) throw error;
+    expect(error.cause).toMatchObject({ cause: dnsError });
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
+
+  it("exposes the refreshed failure on an existing sandbox handle", async () => {
+    const record = cp.seed("running");
+    const failure = {
+      source: "assigner",
+      code: "boot_failed",
+      message: "VM boot failed",
+      attempts: 1,
+      distinct_nodes: 1,
+      occurred_at: "2026-10-23T10:00:00Z",
+    };
+    const refreshing = new HttpControlPlaneClient({
+      apiKey: cp.apiKey,
+      baseUrl: cp.url,
+      fetch: async (input, init) =>
+        record.status === "failed"
+          ? Response.json({ ...record, last_error: JSON.stringify(failure) })
+          : fetch(input, init),
+    });
+    const sandbox = await Sandbox.connect(refreshing, record.id, options);
+    expect(sandbox.lastError).toBeUndefined();
+    record.status = "failed";
+    await sandbox.refresh();
+    expect(sandbox.lastError).toMatchObject({ code: "boot_failed", message: "VM boot failed" });
+  });
+
+  it("retains a string failure reason when refusing an already failed sandbox", async () => {
+    const failed = new HttpControlPlaneClient({
+      apiKey: "k",
+      fetch: async () =>
+        Response.json({
+          id: "sbx-failed",
+          status: "failed",
+          last_error: "agent boot failed: disk unavailable",
+        }),
+    });
+    await expect(Sandbox.connect(failed, "sbx-failed", options)).rejects.toMatchObject({
+      state: "failed",
+      lastError: "agent boot failed: disk unavailable",
+      message: expect.stringContaining("agent boot failed: disk unavailable"),
+    });
   });
 
   it("refuses to attach to a deleting sandbox without minting or polling health", async () => {

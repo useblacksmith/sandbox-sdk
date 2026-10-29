@@ -100,6 +100,65 @@ describe("HttpControlPlaneClient", () => {
     expect((await c.delete(b.id)).state).toBe("deleting");
   });
 
+  it("maps structured last_error and preserves the original wire response", async () => {
+    const failure = {
+      source: "assigner",
+      code: "node_boot_failed",
+      message: "node could not boot VM",
+      attempts: 2,
+      distinct_nodes: 2,
+      occurred_at: "2026-10-23T10:00:00Z",
+    };
+    const c = new HttpControlPlaneClient({
+      apiKey: "k",
+      fetch: async () =>
+        Response.json({ id: "sbx-failed", status: "failed", last_error: JSON.stringify(failure) }),
+    });
+    const record = await c.get("sbx-failed");
+    expect(record.lastError).toEqual({
+      source: "assigner",
+      code: "node_boot_failed",
+      message: "node could not boot VM",
+      attempts: 2,
+      distinctNodes: 2,
+      occurredAt: "2026-10-23T10:00:00Z",
+    });
+    expect(record.raw.last_error).toBe(JSON.stringify(failure));
+  });
+
+  it.each([null, undefined])("omits an absent last_error (%s)", async (last_error) => {
+    const c = new HttpControlPlaneClient({
+      apiKey: "k",
+      fetch: async () => Response.json({ id: "sbx-ok", status: "running", last_error }),
+    });
+    expect((await c.get("sbx-ok")).lastError).toBeUndefined();
+  });
+
+  it.each([
+    "agent boot failed",
+    "{malformed JSON",
+    JSON.stringify({ source: "assigner", code: "boot_failed", message: 123 }),
+    JSON.stringify({ source: "assigner", code: "boot_failed", message: "missing metadata" }),
+    "null",
+  ])("retains an undecodable failure string: %s", async (last_error) => {
+    const c = new HttpControlPlaneClient({
+      apiKey: "k",
+      fetch: async () =>
+        Response.json({
+          id: "sbx-failed",
+          status: "failed",
+          hostname: 123,
+          hostnames: [123],
+          last_error,
+        }),
+    });
+    const record = await c.get("sbx-failed");
+    expect(record.state).toBe("failed");
+    expect(record.lastError).toBe(last_error);
+    expect(record.hostname).toBeUndefined();
+    expect(record.hostnames).toBeUndefined();
+  });
+
   it("passes state, label and limit through as list query parameters", async () => {
     const running = cp.seed();
     running.labels = ["ci"];
