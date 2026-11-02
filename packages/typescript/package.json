@@ -26,6 +26,9 @@
     "test:watch": "vitest --watch",
     "generate": "openapi-ts"
   },
+  "dependencies": {
+    "zod": "4.6.1"
+  },
   "devDependencies": {
     "@hey-api/openapi-ts": "0.90.10",
     "@types/node": "22.20.2",

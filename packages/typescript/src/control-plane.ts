@@ -4,6 +4,7 @@
  * only part of the SDK expected to change when that API lands. Nothing here
  * talks to the agent.
  */
+import * as z from "zod";
 import { SandboxError, SandboxTransportError } from "./errors.js";
 import type { AgentToken } from "./token.js";
 
@@ -18,6 +19,37 @@ export type SandboxState =
   | "deleted"
   | "failed";
 
+const SandboxFailure = z
+  .object({
+    source: z.string(),
+    code: z.string(),
+    message: z.string(),
+    attempts: z.number().int().nonnegative(),
+    distinct_nodes: z.number().int().nonnegative(),
+    occurred_at: z.string(),
+  })
+  .transform((failure) => ({
+    source: failure.source,
+    code: failure.code,
+    message: failure.message,
+    attempts: failure.attempts,
+    distinctNodes: failure.distinct_nodes,
+    occurredAt: failure.occurred_at,
+  }));
+
+export type SandboxFailure = z.infer<typeof SandboxFailure>;
+
+const SandboxResponse = z.object({
+  id: z.string(),
+  status: z.string(),
+  created_at: z.unknown().optional(),
+  hostname: z.string().optional().catch(undefined),
+  hostnames: z.array(z.string()).optional().catch(undefined),
+  image: z.string().optional().catch(undefined),
+  base_image: z.string().optional().catch(undefined),
+  last_error: z.string().optional().catch(undefined),
+});
+
 export interface SandboxRecord {
   id: string;
   /** Backend `status`; unknown values pass through untouched. */
@@ -27,11 +59,12 @@ export interface SandboxRecord {
   /** Every hostname that reaches the sandbox, canonical first. */
   hostnames?: string[];
   createdAt: Date;
+  lastError?: string | SandboxFailure;
   /** Set on `create` only: the first agent token, so no mint round-trip is needed. */
   token?: MintedToken;
   /** Set on `create` only: the Idempotency-Key matched an earlier create. */
   replayed?: boolean;
-  /** What the sandbox booted from: a catalog image reference or a `snap-…` id. */
+  /** What the sandbox booted from: a catalog image reference, a `machine/<name>[:<version>]` or a `snap-…` id. */
   image?: string;
   /** The backend response as received. */
   raw: Record<string, unknown>;
@@ -41,7 +74,12 @@ export interface SandboxRecord {
 export type SandboxCreateOptions = SandboxCreateSettings &
   (
     | {
-        /** A catalog image reference or a sandbox image snapshot id (`snap-…`). */
+        /**
+         * A catalog image reference (`ubuntu24`, `ubuntu24:canary`), a Blacksmith
+         * Machine's image (`machine/web-ci` for its latest ready version,
+         * `machine/web-ci:3` for version 3, `machine/web-ci:stable` for the image
+         * tagged `stable`) or a sandbox image snapshot id (`snap-…`).
+         */
         image: string;
         /** @deprecated Use `image`. Sent as `base_image`; accepts catalog images only. */
         baseImage?: string;
@@ -158,6 +196,32 @@ export class ControlPlaneError extends SandboxError {
     this.sandboxStatus = sandboxStatus;
     this.retryAfterMs = retryAfterMs;
   }
+}
+
+const TerminalFailureDetails = z.object({
+  sandbox_id: z.string(),
+  last_error: z.string().nullable(),
+});
+
+export function terminalFailureRecord(error: unknown): SandboxRecord | undefined {
+  if (
+    !(error instanceof ControlPlaneError) ||
+    error.status !== 409 ||
+    error.code !== "invalid_state" ||
+    error.sandboxStatus !== "failed"
+  ) {
+    return undefined;
+  }
+  const parsed = TerminalFailureDetails.safeParse(error.details);
+  if (!parsed.success) return undefined;
+  return {
+    id: parsed.data.sandbox_id,
+    state: "failed",
+    createdAt: new Date(NaN),
+    lastError:
+      parsed.data.last_error === null ? error.message : parseSandboxFailure(parsed.data.last_error),
+    raw: { id: parsed.data.sandbox_id, status: "failed", last_error: parsed.data.last_error },
+  };
 }
 
 export interface HttpControlPlaneClientOptions {
@@ -429,24 +493,34 @@ function toCreateBody(options: SandboxCreateOptions): Record<string, unknown> {
 }
 
 function toRecord(raw: Record<string, unknown>): SandboxRecord {
-  const id = raw.id;
-  const state = raw.status;
-  if (typeof id !== "string" || typeof state !== "string") {
-    throw new SandboxError("control plane sandbox response is missing id or status");
+  const parsed = SandboxResponse.safeParse(raw);
+  if (!parsed.success) {
+    throw new SandboxError("invalid control plane sandbox response", { cause: parsed.error });
   }
+  const data = parsed.data;
   const record: SandboxRecord = {
-    id,
-    state,
-    createdAt: parseDate(raw.created_at) ?? new Date(NaN),
+    id: data.id,
+    state: data.status,
+    createdAt: parseDate(data.created_at) ?? new Date(NaN),
     raw,
   };
-  if (typeof raw.hostname === "string") record.hostname = raw.hostname;
-  if (typeof raw.image === "string") record.image = raw.image;
-  else if (typeof raw.base_image === "string") record.image = raw.base_image;
-  if (Array.isArray(raw.hostnames) && raw.hostnames.every((h) => typeof h === "string")) {
-    record.hostnames = raw.hostnames;
-  }
+  if (data.hostname !== undefined) record.hostname = data.hostname;
+  if (data.image !== undefined) record.image = data.image;
+  else if (data.base_image !== undefined) record.image = data.base_image;
+  if (data.hostnames !== undefined) record.hostnames = data.hostnames;
+  if (data.last_error !== undefined) record.lastError = parseSandboxFailure(data.last_error);
   return record;
+}
+
+function parseSandboxFailure(raw: string): string | SandboxFailure {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+  const parsed = SandboxFailure.safeParse(decoded);
+  return parsed.success ? parsed.data : raw;
 }
 
 function toMintedToken(raw: Record<string, unknown>): MintedToken {
@@ -465,24 +539,26 @@ function errorFromResponse(
   retryAfterMs: number | undefined,
 ): ControlPlaneError {
   try {
-    const parsed: unknown = JSON.parse(text);
-    if (typeof parsed === "object" && parsed !== null && "error" in parsed) {
-      const error = asObject(parsed.error);
-      if (typeof error.code === "string" && typeof error.message === "string") {
-        const details =
-          typeof error.details === "object" && error.details !== null
-            ? (error.details as Record<string, unknown>)
-            : undefined;
-        const sandboxStatus = typeof error.status === "string" ? error.status : undefined;
-        return new ControlPlaneError(
-          status,
-          error.code,
-          error.message,
-          details,
-          sandboxStatus,
-          retryAfterMs,
-        );
-      }
+    const parsed = z
+      .object({
+        error: z.object({
+          code: z.string(),
+          message: z.string(),
+          details: z.record(z.string(), z.unknown()).optional().catch(undefined),
+          status: z.string().optional().catch(undefined),
+        }),
+      })
+      .safeParse(JSON.parse(text));
+    if (parsed.success) {
+      const { error } = parsed.data;
+      return new ControlPlaneError(
+        status,
+        error.code,
+        error.message,
+        error.details,
+        error.status,
+        retryAfterMs,
+      );
     }
   } catch {
     // not JSON or not the envelope
@@ -499,10 +575,11 @@ function errorFromResponse(
 }
 
 function asObject(value: unknown): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new SandboxError("control plane response is not a JSON object");
+  const parsed = z.record(z.string(), z.unknown()).safeParse(value);
+  if (!parsed.success) {
+    throw new SandboxError("control plane response is not a JSON object", { cause: parsed.error });
   }
-  return value as Record<string, unknown>;
+  return parsed.data;
 }
 
 function parseDate(value: unknown): Date | undefined {
