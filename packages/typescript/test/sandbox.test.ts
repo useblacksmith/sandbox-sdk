@@ -827,31 +827,71 @@ describe("transport-error re-check", () => {
     expect(await sandbox.client.listProcesses()).toEqual([]);
   });
 
-  it("surfaces SandboxNotRunningError when the sandbox stays paused past the cycle timeout", async () => {
+  it("surfaces SandboxNotRunningError when a resume outlives the cycle timeout", async () => {
     const waits: PauseResumeWait[] = [];
     const sandbox = await Sandbox.create(
       controlPlane,
       { image: "ubuntu-24.04" },
       { ...options, pauseResumeTimeoutMs: 400, onPauseResumeWait: (wait) => waits.push(wait) },
     );
-    cp.records.get(sandbox.id)!.status = "paused";
+    cp.records.get(sandbox.id)!.status = "resuming";
     agent.faults.push("reset", "reset", "reset");
 
     const started = Date.now();
     const err = await sandbox.exec({ shell: "echo nope" }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(SandboxNotRunningError);
-    expect(err).toMatchObject({ id: sandbox.id, state: "paused" });
+    expect(err).toMatchObject({ id: sandbox.id, state: "resuming" });
     expect(String((err as SandboxNotRunningError).cause)).toContain("within 400ms");
-    expect(sandbox.state).toBe("paused");
     expect(agent.requests.filter(isExecStart)).toHaveLength(3);
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(waits).toHaveLength(1);
     expect(waits[0]).toMatchObject({
       id: sandbox.id,
-      from: "paused",
-      state: "paused",
+      from: "resuming",
+      state: "resuming",
       outcome: "timeout",
     });
+  });
+
+  it("fails at once when an idle pause settles with no resume instead of waiting out the cycle timeout", async () => {
+    const waits: PauseResumeWait[] = [];
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04" },
+      { ...options, pauseResumeTimeoutMs: 30_000, onPauseResumeWait: (wait) => waits.push(wait) },
+    );
+    const record = cp.records.get(sandbox.id)!;
+    record.status = "pausing";
+    agent.faults.push("reset", "reset", "reset");
+    setTimeout(() => (record.status = "paused"), 100);
+
+    const started = Date.now();
+    const err = await sandbox.exec({ shell: "echo nope" }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SandboxNotRunningError);
+    expect(err).toMatchObject({ id: sandbox.id, state: "paused" });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(agent.requests.filter(isExecStart)).toHaveLength(3);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ from: "pausing", state: "paused", outcome: "not_running" });
+  });
+
+  it("does not wait at all for a sandbox already paused", async () => {
+    const waits: PauseResumeWait[] = [];
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04" },
+      { ...options, onPauseResumeWait: (wait) => waits.push(wait) },
+    );
+    cp.requests.length = 0;
+    cp.records.get(sandbox.id)!.status = "paused";
+    agent.faults.push("sandbox_paused", "sandbox_paused");
+
+    const err = await sandbox.listProcesses().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SandboxNotRunningError);
+    expect(err).toMatchObject({ state: "paused" });
+    expect(cpCalls().filter((c) => c === `GET /api/v1/sandboxes/${sandbox.id}`)).toHaveLength(1);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ from: "paused", state: "paused", outcome: "not_running" });
   });
 
   it("waits through a pause → resume cycle and replays once the sandbox runs again", async () => {
@@ -864,10 +904,10 @@ describe("transport-error re-check", () => {
     cp.requests.length = 0;
     const record = cp.records.get(sandbox.id)!;
     record.status = "pausing";
-    // The retired socket answers for the old VM; the record walks pausing → paused → resuming → running.
+    // The retired socket answers for the old VM; another caller resumes the moment the pause
+    // settles, so the polls see pausing → resuming → running.
     agent.faults.push("sandbox_paused", "sandbox_paused");
-    setTimeout(() => (record.status = "paused"), 300);
-    setTimeout(() => (record.status = "resuming"), 600);
+    setTimeout(() => (record.status = "resuming"), 300);
     setTimeout(() => (record.status = "running"), 900);
 
     expect(await sandbox.listProcesses()).toEqual([]);
@@ -1115,7 +1155,7 @@ describe("transport-error re-check", () => {
     }
   });
 
-  it("keeps waiting when the sandbox is paused again before its agent answers", async () => {
+  it("keeps waiting when the sandbox pauses again and is resumed before its agent answers", async () => {
     const waits: PauseResumeWait[] = [];
     const sandbox = await Sandbox.create(
       controlPlane,
@@ -1128,7 +1168,7 @@ describe("transport-error re-check", () => {
     agent.faults.push("sandbox_paused", "sandbox_paused", "unavailable");
     setTimeout(() => (record.status = "running"), 100);
     setTimeout(() => (record.status = "pausing"), 350);
-    setTimeout(() => (record.status = "paused"), 600);
+    setTimeout(() => (record.status = "resuming"), 600);
     setTimeout(() => (record.status = "running"), 900);
 
     expect(await sandbox.listProcesses()).toEqual([]);
@@ -1236,20 +1276,14 @@ describe("transport-error re-check", () => {
   ] as const)(
     "surfaces SandboxNotRunningError for $fault when the control plane says $state",
     async ({ fault, state }) => {
-      // `paused` is waited out as a pause → resume cycle first; its cause is the timeout, wrapping the answer.
-      const sandbox = await Sandbox.create(
-        controlPlane,
-        { image: "ubuntu-24.04" },
-        { ...options, pauseResumeTimeoutMs: 300 },
-      );
+      const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
       cp.records.get(sandbox.id)!.status = state;
       agent.faults.push(fault, fault);
 
       const err = await sandbox.exec({ shell: "echo nope" }).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(SandboxNotRunningError);
       expect(err).toMatchObject({ id: sandbox.id, state });
-      let cause = (err as SandboxNotRunningError).cause;
-      if (state === "paused") cause = (cause as Error).cause;
+      const cause = (err as SandboxNotRunningError).cause;
       expect(cause).toBeInstanceOf(SandboxApiError);
       expect(cause).toMatchObject({ code: fault, details: { vm_id: "vm-old" } });
       expect(sandbox.state).toBe(state);
