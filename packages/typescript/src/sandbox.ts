@@ -63,8 +63,8 @@ export interface PauseResumeWait {
   /** The state the wait ended on. */
   state: string;
   /**
-   * `running`: the call replays; `not_running`: the cycle ended in a terminal state;
-   * `timeout`: it outlived `pauseResumeTimeoutMs`; `aborted`: the caller's signal fired;
+   * `running`: the call replays; `not_running`: the cycle settled in `paused` or a terminal
+   * state; `timeout`: it outlived `pauseResumeTimeoutMs`; `aborted`: the caller's signal fired;
    * `failed`: a control-plane poll failed, so how the cycle went is unknown.
    */
   outcome: "running" | "not_running" | "timeout" | "aborted" | "failed";
@@ -76,9 +76,10 @@ export interface SandboxOptions {
   readyTimeoutMs?: number;
   /**
    * How long an agent call that finds the sandbox mid pause → resume cycle (`pausing`,
-   * `paused`, `resuming`, `starting`) waits for `running` and a healthy agent before failing
-   * with `SandboxNotRunningError`. Default 30s, the cycle SLO: production pauses settle in
-   * p99 14s and resumes report running in p99 6.4s (2026-10).
+   * `resuming`, `starting`) waits for `running` and a healthy agent before failing with
+   * `SandboxNotRunningError`. A cycle that settles in `paused` fails at once: only `resume()`
+   * brings it back. Default 30s, the cycle SLO: production pauses settle in p99 14s and
+   * resumes report running in p99 6.4s (2026-10).
    */
   pauseResumeTimeoutMs?: number;
   /** Called once per wait with how it ended, so the caller can chart the cycle SLO. */
@@ -429,10 +430,11 @@ export class Sandbox {
 
   /**
    * Polls the record while a pause → resume cycle runs, then waits for the agent on the host
-   * the resume landed on; the replay follows. A cycle that lands back in `pausing`/`paused`
-   * before the agent answers is polled again. A final poll can start at the deadline and
-   * use up to 250ms more; all reads and health checks share that cutoff. A terminal state,
-   * the caller's `signal` or a failed poll ends it sooner. Every exit reports to `onPauseResumeWait`.
+   * the resume landed on; the replay follows. A cycle that lands back in `pausing` before the
+   * agent answers is polled again. A final poll can start at the deadline and use up to 250ms
+   * more; all reads and health checks share that cutoff. A record in `paused` or a terminal
+   * state, the caller's `signal` or a failed poll ends it sooner. Every exit reports to
+   * `onPauseResumeWait`.
    */
   private async waitThroughPauseResume(cause: RecheckCause, signal?: AbortSignal): Promise<void> {
     const from = this.record.state;
@@ -478,7 +480,9 @@ export class Sandbox {
           if (isTerminal(this.record.state)) {
             return fail("not_running", new SandboxNotRunningError(this.record, { cause }));
           }
-          if (!isInPauseResumeCycle(this.record.state)) {
+          // A settled pause has no resume in flight (a resume moves the record to `resuming`),
+          // so waiting would only run out the clock.
+          if (!isInPauseResumeCycle(this.record.state) || this.record.state === "paused") {
             return fail("not_running", new SandboxNotRunningError(this.record, { cause }));
           }
           const left = deadline - Date.now();
