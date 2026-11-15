@@ -1,3 +1,11 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="./.github/assets/wordmark-white.svg" width="300">
+    <source media="(prefers-color-scheme: light)" srcset="./.github/assets/wordmark-black.svg" width="300">
+    <img alt="Blacksmith" src="./.github/assets/wordmark-black.svg" width="300">
+  </picture>
+</p>
+
 # Blacksmith Sandbox SDKs
 
 Client libraries for [Blacksmith](https://blacksmith.sh) sandboxes: fast-booting
