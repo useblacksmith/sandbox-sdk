@@ -6,8 +6,6 @@
   </picture>
 </p>
 
-# Blacksmith Sandbox SDKs
-
 Client libraries for [Blacksmith](https://blacksmith.sh) sandboxes: fast-booting
 microVMs you drive over HTTP. Run commands, start long-lived processes and
 stream their output, move files, expose ports, and pause or resume.
