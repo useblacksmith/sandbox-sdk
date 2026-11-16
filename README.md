@@ -29,7 +29,11 @@ npm install @useblacksmith/sandbox
 import { HttpControlPlaneClient, Sandbox } from "@useblacksmith/sandbox";
 
 const cp = new HttpControlPlaneClient({ apiKey: process.env.BLACKSMITH_API_KEY! });
-const sandbox = await Sandbox.create(cp, { image: "ubuntu-24.04", workload: "ci-repro" });
+const sandbox = await Sandbox.create(cp, {
+  image: "ubuntu-24.04",
+  workload: "ci-repro",
+  tenant: "acme",
+});
 
 const { exit_code, stdout } = await sandbox.exec({ cmd: ["uname", "-a"] });
 console.log(exit_code, stdout);
@@ -42,13 +46,6 @@ for await (const chunk of sandbox.streamOutput("build", { follow: true })) {
 
 await sandbox.delete();
 ```
-
-`workload` is required: a short, stable name for the kind of work the sandbox
-does, such as `agent-session`, `test-runner` or `pr-review`. If you run
-sandboxes on behalf of your own customers or teams, also pass `tenant` to say
-whose work it is. The
-[TypeScript README](./packages/typescript/README.md#workload-and-tenant) lists
-the allowed characters.
 
 ## How the SDKs are built
 
