@@ -84,9 +84,11 @@ describe("terminal control-plane failures", () => {
         },
       });
       const create = vi.spyOn(http, "create");
-      const error = await Sandbox.create(http, { image: "ubuntu-24.04" }, options).catch(
-        (error: unknown) => error,
-      );
+      const error = await Sandbox.create(
+        http,
+        { image: "ubuntu-24.04", workload: "test" },
+        options,
+      ).catch((error: unknown) => error);
       const original = await create.mock.results[0]?.value.catch((error: unknown) => error);
       expect(error).toBeInstanceOf(SandboxNotRunningError);
       expect(error).not.toBeInstanceOf(ControlPlaneError);
@@ -128,7 +130,9 @@ describe("terminal control-plane failures", () => {
       },
     });
 
-    await expect(Sandbox.create(http, { image: "ubuntu-24.04" }, options)).rejects.toMatchObject({
+    await expect(
+      Sandbox.create(http, { image: "ubuntu-24.04", workload: "test" }, options),
+    ).rejects.toMatchObject({
       id: "sbx-failed",
       state: "failed",
       code: failure.code,
@@ -229,7 +233,11 @@ describe("terminal control-plane failures", () => {
 
 describe("Sandbox.create / connect", () => {
   it("creates, uses the token from the create response, waits for health and runs commands", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
 
     expect(sandbox.state).toBe("running");
     expect(cpCalls()).toEqual(["POST /api/v1/sandboxes"]);
@@ -262,7 +270,7 @@ describe("Sandbox.create / connect", () => {
     await expect(
       Sandbox.create(
         retentionIgnoringControlPlane(),
-        { image: "ubuntu-24.04", idleDeleteTimeoutSeconds: 604800 },
+        { image: "ubuntu-24.04", workload: "test", idleDeleteTimeoutSeconds: 604800 },
         options,
       ),
     ).rejects.toThrow("control plane did not accept idle deletion policy");
@@ -275,7 +283,12 @@ describe("Sandbox.create / connect", () => {
     await expect(
       Sandbox.create(
         retentionIgnoringControlPlane(),
-        { image: "ubuntu-24.04", idleDeleteTimeoutSeconds: 604800, idempotencyKey: "key-1" },
+        {
+          image: "ubuntu-24.04",
+          workload: "test",
+          idleDeleteTimeoutSeconds: 604800,
+          idempotencyKey: "key-1",
+        },
         options,
       ),
     ).rejects.toThrow("control plane did not accept idle deletion policy");
@@ -288,7 +301,12 @@ describe("Sandbox.create / connect", () => {
     await expect(
       Sandbox.create(
         retentionIgnoringControlPlane(),
-        { image: "ubuntu-24.04", idleDeleteTimeoutSeconds: 604800, idempotencyKey: "key-1" },
+        {
+          image: "ubuntu-24.04",
+          workload: "test",
+          idleDeleteTimeoutSeconds: 604800,
+          idempotencyKey: "key-1",
+        },
         options,
       ),
     ).rejects.toThrow("control plane did not accept idle deletion policy");
@@ -299,7 +317,7 @@ describe("Sandbox.create / connect", () => {
   it("accepts an acknowledged idle retention policy and runs commands", async () => {
     const sandbox = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04", idleDeleteTimeoutSeconds: 604800 },
+      { image: "ubuntu-24.04", workload: "test", idleDeleteTimeoutSeconds: 604800 },
       options,
     );
     expect((await sandbox.exec({ shell: "echo hello" })).stdout).toBe("hello\n");
@@ -308,7 +326,11 @@ describe("Sandbox.create / connect", () => {
   it("mints a token when the create response has none", async () => {
     cp.tokenOnCreate = false;
     try {
-      const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+      const sandbox = await Sandbox.create(
+        controlPlane,
+        { image: "ubuntu-24.04", workload: "test" },
+        options,
+      );
       expect(cpCalls()).toEqual([
         "POST /api/v1/sandboxes",
         `POST /api/v1/sandboxes/${sandbox.id}/tokens`,
@@ -462,7 +484,7 @@ describe("Sandbox.create / connect", () => {
     agent.faults.push(...Array<"reset">(30).fill("reset"));
     const err = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04" },
+      { image: "ubuntu-24.04", workload: "test" },
       { ...options, readyTimeoutMs: 300 },
     ).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(SandboxTransportError);
@@ -477,7 +499,7 @@ describe("Sandbox.create / connect", () => {
     agent.faults.push(...Array<"reset">(30).fill("reset"));
     const err = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04", idempotencyKey: "key-1" },
+      { image: "ubuntu-24.04", workload: "test", idempotencyKey: "key-1" },
       { ...options, readyTimeoutMs: 300 },
     ).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(SandboxTransportError);
@@ -524,7 +546,11 @@ describe("Sandbox.create / connect", () => {
 
 describe("token lifecycle through the control plane", () => {
   it("re-mints via cp.mintToken after token_expired", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     agent.expiredTokens.add("tok-1");
 
     const result = await sandbox.exec({ shell: "echo again" });
@@ -555,7 +581,11 @@ describe("tokens shared across handles", () => {
   });
 
   it("reuses the token a create returned", async () => {
-    const created = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const created = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     const connected = await Sandbox.connect(controlPlane, created.id, options);
     await connected.exec({ shell: "true" });
 
@@ -667,7 +697,11 @@ describe("tokens shared across handles", () => {
 
 describe("lifecycle", () => {
   it("pause, resume and delete update state", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     expect((await sandbox.pause()).state).toBe("paused");
     expect(sandbox.state).toBe("paused");
     expect((await sandbox.resume()).state).toBe("running");
@@ -678,7 +712,11 @@ describe("lifecycle", () => {
 
 describe("ports", () => {
   it("exposes, lists and unexposes ports through the agent, re-checking and replaying once", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     agent.requests.length = 0;
     cp.requests.length = 0;
     agent.faults.push("reset", "reset", "reset");
@@ -699,7 +737,11 @@ describe("ports", () => {
 
 describe("disks", () => {
   it("attaches, lists and detaches sticky disks, re-checking but not replaying an attach", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     agent.restartVm();
     agent.entityJwts.set(9, "entity-jwt-9");
     agent.requests.length = 0;
@@ -727,7 +769,11 @@ describe("disks", () => {
 
 describe("transport-error re-check", () => {
   it("retries once when the control plane still says running", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.requests.length = 0;
     agent.faults.push("reset", "reset", "reset");
 
@@ -737,7 +783,11 @@ describe("transport-error re-check", () => {
   });
 
   it("rechecks a gone response after replaying a transport failure", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.requests.length = 0;
     agent.faults.push("reset", "reset", "reset", "sandbox_failed", "sandbox_failed");
 
@@ -747,7 +797,11 @@ describe("transport-error re-check", () => {
   });
 
   it("rechecks a gone response after transport replay when the sandbox has failed", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.requests.length = 0;
     agent.faults.push("reset", "reset", "reset", "sandbox_failed");
     const get = controlPlane.get.bind(controlPlane);
@@ -768,7 +822,11 @@ describe("transport-error re-check", () => {
   });
 
   it("does not replay a second transport failure after recovering a gone response", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.requests.length = 0;
     agent.faults.push(
       "reset",
@@ -787,7 +845,11 @@ describe("transport-error re-check", () => {
   });
 
   it("replays exec under the same process id once the control plane says running", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.requests.length = 0;
     agent.faults.push("reset", "reset", "reset");
 
@@ -800,7 +862,11 @@ describe("transport-error re-check", () => {
   });
 
   it("replays exec after the output stream kept dropping without running the command twice", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { baseImage: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { baseImage: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.requests.length = 0;
     const marker = join(agent.fsRoot, "sandbox-ran-once");
     agent.faults.push("pass", "cut-stream", "cut-stream", "cut-stream");
@@ -815,7 +881,11 @@ describe("transport-error re-check", () => {
   });
 
   it("does not replay an exec that ran out of its own deadline", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { baseImage: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { baseImage: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.requests.length = 0;
 
     const err = await sandbox
@@ -827,47 +897,87 @@ describe("transport-error re-check", () => {
     expect(await sandbox.client.listProcesses()).toEqual([]);
   });
 
-  it("surfaces SandboxNotRunningError when the sandbox stays paused past the cycle timeout", async () => {
+  it("surfaces SandboxNotRunningError when a resume outlives the cycle timeout", async () => {
     const waits: PauseResumeWait[] = [];
     const sandbox = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04" },
+      { image: "ubuntu-24.04", workload: "test" },
       { ...options, pauseResumeTimeoutMs: 400, onPauseResumeWait: (wait) => waits.push(wait) },
     );
-    cp.records.get(sandbox.id)!.status = "paused";
+    cp.records.get(sandbox.id)!.status = "resuming";
     agent.faults.push("reset", "reset", "reset");
 
     const started = Date.now();
     const err = await sandbox.exec({ shell: "echo nope" }).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(SandboxNotRunningError);
-    expect(err).toMatchObject({ id: sandbox.id, state: "paused" });
+    expect(err).toMatchObject({ id: sandbox.id, state: "resuming" });
     expect(String((err as SandboxNotRunningError).cause)).toContain("within 400ms");
-    expect(sandbox.state).toBe("paused");
     expect(agent.requests.filter(isExecStart)).toHaveLength(3);
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(waits).toHaveLength(1);
     expect(waits[0]).toMatchObject({
       id: sandbox.id,
-      from: "paused",
-      state: "paused",
+      from: "resuming",
+      state: "resuming",
       outcome: "timeout",
     });
+  });
+
+  it("fails at once when an idle pause settles with no resume instead of waiting out the cycle timeout", async () => {
+    const waits: PauseResumeWait[] = [];
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      { ...options, pauseResumeTimeoutMs: 30_000, onPauseResumeWait: (wait) => waits.push(wait) },
+    );
+    const record = cp.records.get(sandbox.id)!;
+    record.status = "pausing";
+    agent.faults.push("reset", "reset", "reset");
+    setTimeout(() => (record.status = "paused"), 100);
+
+    const started = Date.now();
+    const err = await sandbox.exec({ shell: "echo nope" }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SandboxNotRunningError);
+    expect(err).toMatchObject({ id: sandbox.id, state: "paused" });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(agent.requests.filter(isExecStart)).toHaveLength(3);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ from: "pausing", state: "paused", outcome: "not_running" });
+  });
+
+  it("does not wait at all for a sandbox already paused", async () => {
+    const waits: PauseResumeWait[] = [];
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      { ...options, onPauseResumeWait: (wait) => waits.push(wait) },
+    );
+    cp.requests.length = 0;
+    cp.records.get(sandbox.id)!.status = "paused";
+    agent.faults.push("sandbox_paused", "sandbox_paused");
+
+    const err = await sandbox.listProcesses().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SandboxNotRunningError);
+    expect(err).toMatchObject({ state: "paused" });
+    expect(cpCalls().filter((c) => c === `GET /api/v1/sandboxes/${sandbox.id}`)).toHaveLength(1);
+    expect(waits).toHaveLength(1);
+    expect(waits[0]).toMatchObject({ from: "paused", state: "paused", outcome: "not_running" });
   });
 
   it("waits through a pause → resume cycle and replays once the sandbox runs again", async () => {
     const waits: PauseResumeWait[] = [];
     const sandbox = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04" },
+      { image: "ubuntu-24.04", workload: "test" },
       { ...options, onPauseResumeWait: (wait) => waits.push(wait) },
     );
     cp.requests.length = 0;
     const record = cp.records.get(sandbox.id)!;
     record.status = "pausing";
-    // The retired socket answers for the old VM; the record walks pausing → paused → resuming → running.
+    // The retired socket answers for the old VM; another caller resumes the moment the pause
+    // settles, so the polls see pausing → resuming → running.
     agent.faults.push("sandbox_paused", "sandbox_paused");
-    setTimeout(() => (record.status = "paused"), 300);
-    setTimeout(() => (record.status = "resuming"), 600);
+    setTimeout(() => (record.status = "resuming"), 300);
     setTimeout(() => (record.status = "running"), 900);
 
     expect(await sandbox.listProcesses()).toEqual([]);
@@ -886,7 +996,7 @@ describe("transport-error re-check", () => {
     const waits: PauseResumeWait[] = [];
     const sandbox = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04" },
+      { image: "ubuntu-24.04", workload: "test" },
       { ...options, pauseResumeTimeoutMs: 600, onPauseResumeWait: (wait) => waits.push(wait) },
     );
     const record = cp.records.get(sandbox.id)!;
@@ -911,7 +1021,7 @@ describe("transport-error re-check", () => {
     const waits: PauseResumeWait[] = [];
     const sandbox = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04" },
+      { image: "ubuntu-24.04", workload: "test" },
       { ...options, pauseResumeTimeoutMs: 400, onPauseResumeWait: (wait) => waits.push(wait) },
     );
     const record = cp.records.get(sandbox.id)!;
@@ -929,7 +1039,7 @@ describe("transport-error re-check", () => {
     const waits: PauseResumeWait[] = [];
     const sandbox = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04" },
+      { image: "ubuntu-24.04", workload: "test" },
       { ...options, pauseResumeTimeoutMs: 300, onPauseResumeWait: (wait) => waits.push(wait) },
     );
     const record = cp.records.get(sandbox.id)!;
@@ -963,7 +1073,7 @@ describe("transport-error re-check", () => {
     const waits: PauseResumeWait[] = [];
     const sandbox = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04" },
+      { image: "ubuntu-24.04", workload: "test" },
       { ...options, pauseResumeTimeoutMs: 300, onPauseResumeWait: (wait) => waits.push(wait) },
     );
     cp.records.get(sandbox.id)!.status = "resuming";
@@ -999,7 +1109,7 @@ describe("transport-error re-check", () => {
   it("bounds a stalled health check after the sandbox resumes", async () => {
     const sandbox = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04" },
+      { image: "ubuntu-24.04", workload: "test" },
       { ...options, pauseResumeTimeoutMs: 300 },
     );
     cp.records.get(sandbox.id)!.status = "resuming";
@@ -1015,7 +1125,11 @@ describe("transport-error re-check", () => {
   });
 
   it("aborts the initial control-plane recheck without waiting for its response", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.records.get(sandbox.id)!.status = "resuming";
     agent.faults.push("sandbox_paused", "sandbox_paused");
     const get = controlPlane.get.bind(controlPlane);
@@ -1043,7 +1157,7 @@ describe("transport-error re-check", () => {
     const waits: PauseResumeWait[] = [];
     const sandbox = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04" },
+      { image: "ubuntu-24.04", workload: "test" },
       { ...options, onPauseResumeWait: (wait) => waits.push(wait) },
     );
     cp.records.get(sandbox.id)!.status = "resuming";
@@ -1064,7 +1178,7 @@ describe("transport-error re-check", () => {
     const waits: PauseResumeWait[] = [];
     const sandbox = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04" },
+      { image: "ubuntu-24.04", workload: "test" },
       { ...options, pauseResumeTimeoutMs: 10_000, onPauseResumeWait: (wait) => waits.push(wait) },
     );
     const record = cp.records.get(sandbox.id)!;
@@ -1092,7 +1206,7 @@ describe("transport-error re-check", () => {
     const waits: PauseResumeWait[] = [];
     const sandbox = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04" },
+      { image: "ubuntu-24.04", workload: "test" },
       { ...options, onPauseResumeWait: (wait) => waits.push(wait) },
     );
     cp.records.get(sandbox.id)!.status = "resuming";
@@ -1115,11 +1229,11 @@ describe("transport-error re-check", () => {
     }
   });
 
-  it("keeps waiting when the sandbox is paused again before its agent answers", async () => {
+  it("keeps waiting when the sandbox pauses again and is resumed before its agent answers", async () => {
     const waits: PauseResumeWait[] = [];
     const sandbox = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04" },
+      { image: "ubuntu-24.04", workload: "test" },
       { ...options, pauseResumeTimeoutMs: 5_000, onPauseResumeWait: (wait) => waits.push(wait) },
     );
     const record = cp.records.get(sandbox.id)!;
@@ -1128,7 +1242,7 @@ describe("transport-error re-check", () => {
     agent.faults.push("sandbox_paused", "sandbox_paused", "unavailable");
     setTimeout(() => (record.status = "running"), 100);
     setTimeout(() => (record.status = "pausing"), 350);
-    setTimeout(() => (record.status = "paused"), 600);
+    setTimeout(() => (record.status = "resuming"), 600);
     setTimeout(() => (record.status = "running"), 900);
 
     expect(await sandbox.listProcesses()).toEqual([]);
@@ -1140,7 +1254,7 @@ describe("transport-error re-check", () => {
     const waits: PauseResumeWait[] = [];
     const sandbox = await Sandbox.create(
       controlPlane,
-      { image: "ubuntu-24.04" },
+      { image: "ubuntu-24.04", workload: "test" },
       { ...options, onPauseResumeWait: (wait) => waits.push(wait) },
     );
     const record = cp.records.get(sandbox.id)!;
@@ -1156,7 +1270,11 @@ describe("transport-error re-check", () => {
   });
 
   it("replays once a retired socket's sandbox_paused when the control plane says running", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.requests.length = 0;
     // The client redials once on its own; the second answer sends it to the control plane.
     agent.faults.push("sandbox_paused", "sandbox_paused");
@@ -1168,7 +1286,11 @@ describe("transport-error re-check", () => {
   });
 
   it("does not let a retired socket's sandbox_failed override a running control plane record", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.requests.length = 0;
     agent.faults.push("sandbox_failed");
 
@@ -1180,7 +1302,11 @@ describe("transport-error re-check", () => {
   });
 
   it("attaches to the started process when the output read hits a retired socket", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.requests.length = 0;
     const marker = join(agent.fsRoot, "sandbox-tombstone-ran-once");
     agent.faults.push("pass", "sandbox_failed");
@@ -1193,7 +1319,11 @@ describe("transport-error re-check", () => {
   });
 
   it("gives up after repeated retired-socket answers while the control plane says running", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.requests.length = 0;
     agent.faults.push(
       "sandbox_failed",
@@ -1236,11 +1366,10 @@ describe("transport-error re-check", () => {
   ] as const)(
     "surfaces SandboxNotRunningError for $fault when the control plane says $state",
     async ({ fault, state }) => {
-      // `paused` is waited out as a pause → resume cycle first; its cause is the timeout, wrapping the answer.
       const sandbox = await Sandbox.create(
         controlPlane,
-        { image: "ubuntu-24.04" },
-        { ...options, pauseResumeTimeoutMs: 300 },
+        { image: "ubuntu-24.04", workload: "test" },
+        options,
       );
       cp.records.get(sandbox.id)!.status = state;
       agent.faults.push(fault, fault);
@@ -1248,8 +1377,7 @@ describe("transport-error re-check", () => {
       const err = await sandbox.exec({ shell: "echo nope" }).catch((e: unknown) => e);
       expect(err).toBeInstanceOf(SandboxNotRunningError);
       expect(err).toMatchObject({ id: sandbox.id, state });
-      let cause = (err as SandboxNotRunningError).cause;
-      if (state === "paused") cause = (cause as Error).cause;
+      const cause = (err as SandboxNotRunningError).cause;
       expect(cause).toBeInstanceOf(SandboxApiError);
       expect(cause).toMatchObject({ code: fault, details: { vm_id: "vm-old" } });
       expect(sandbox.state).toBe(state);
@@ -1257,7 +1385,11 @@ describe("transport-error re-check", () => {
   );
 
   it("resumes an output stream after a retired socket's answer when the control plane says running", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     const { process } = await sandbox.startProcess("tomb", {
       shell: "for i in 1 2 3; do echo tick $i; sleep 0.1; done",
     });
@@ -1273,7 +1405,11 @@ describe("transport-error re-check", () => {
   });
 
   it("rechecks but never replays a streaming upload", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.requests.length = 0;
     agent.faults.push("reset");
     const body = new ReadableStream<Uint8Array>({
@@ -1290,7 +1426,11 @@ describe("transport-error re-check", () => {
   });
 
   it("does not retry more than once", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     agent.faults.push(...Array<"reset">(6).fill("reset"));
 
     const err = await sandbox.listProcesses().catch((e: unknown) => e);
@@ -1299,7 +1439,11 @@ describe("transport-error re-check", () => {
   });
 
   it("passes agent errors through untouched", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     cp.requests.length = 0;
     const err = await sandbox.getProcess("missing").catch((e: unknown) => e);
     expect(err).toBeInstanceOf(SandboxApiError);
@@ -1308,7 +1452,11 @@ describe("transport-error re-check", () => {
   });
 
   it("resumes streamOutput from the last delivered offsets", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { image: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     await sandbox.startProcess("p", { shell: "printf abc; sleep 0.3; printf def" });
     await new Promise((resolve) => setTimeout(resolve, 100));
     agent.faults.push("cut-stream");
@@ -1329,7 +1477,11 @@ describe("transport-error re-check", () => {
   });
 
   it("does not resume a stream that hit the caller's idleTimeoutMs", async () => {
-    const sandbox = await Sandbox.create(controlPlane, { baseImage: "ubuntu-24.04" }, options);
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { baseImage: "ubuntu-24.04", workload: "test" },
+      options,
+    );
     await sandbox.startProcess("quiet", { shell: "echo hi; sleep 30" });
     agent.faults.push("stall");
 

@@ -45,6 +45,8 @@ const SandboxResponse = z.object({
   created_at: z.unknown().optional(),
   hostname: z.string().optional().catch(undefined),
   hostnames: z.array(z.string()).optional().catch(undefined),
+  workload: z.string().optional().catch(undefined),
+  tenant: z.string().optional().catch(undefined),
   image: z.string().optional().catch(undefined),
   base_image: z.string().optional().catch(undefined),
   last_error: z.string().optional().catch(undefined),
@@ -64,6 +66,9 @@ export interface SandboxRecord {
   token?: MintedToken;
   /** Set on `create` only: the Idempotency-Key matched an earlier create. */
   replayed?: boolean;
+  /** Absent on sandboxes created before the field existed. */
+  workload?: string;
+  tenant?: string;
   /** What the sandbox booted from: a catalog image reference, a `machine/<name>[:<version>]` or a `snap-…` id. */
   image?: string;
   /** The backend response as received. */
@@ -88,6 +93,44 @@ export type SandboxCreateOptions = SandboxCreateSettings &
   );
 
 export interface SandboxCreateSettings {
+  /**
+   * The kind of work this sandbox does, such as `agent-session`, `test-runner` or `pr-review`.
+   * Blacksmith reports usage per workload, so a clear, stable name lets you see what each kind
+   * of work costs. Keep the set small and reuse values: a name used by one sandbox tells you
+   * nothing.
+   *
+   * Lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit; at most 1024
+   * characters. `create` throws a `TypeError` for anything else.
+   *
+   * Accepted: `test-runner`, `pr_review`, `e2e.v2`, `2fa-check`.
+   * Rejected:
+   *   - `Test-Runner`: uppercase
+   *   - `test runner`: space, including a leading or trailing one
+   *   - `test/runner`, `test:runner`, `tests@v2`: any other punctuation
+   *   - `-test-runner`, `.hidden`, `_private`: starts with `-`, `.` or `_`
+   *   - `e2e-tësts`: a letter outside a-z
+   *   - an empty string
+   */
+  workload: string;
+  /**
+   * Whose work this is, when you run sandboxes on behalf of your own customers or teams, such
+   * as `acme`. Use a stable id or name, and always send it in the same form. Leave it out when
+   * every sandbox is your own.
+   *
+   * Letters, digits, `.`, `_` and `-`, starting with a letter or digit; at most 1024 characters.
+   * Case matters: `Acme` and `acme` are two tenants. `create` throws a `TypeError` for anything
+   * else.
+   *
+   * Accepted: `acme`, `Acme-Corp`, `acme.com`, `cus_Nf3x9`, `42`,
+   * `550e8400-e29b-41d4-a716-446655440000`.
+   * Rejected:
+   *   - `Acme Corp`: space
+   *   - `jane@acme.com`, `org:123`, `acme/eu`, `https://acme.com`: any other punctuation
+   *   - `-acme`: starts with `-`, `.` or `_`
+   *   - `Zoë`: a letter outside A-Z and a-z
+   *   - an empty string; leave `tenant` out instead
+   */
+  tenant?: string;
   arch?: "amd64" | "arm64";
   vcpu?: number;
   env?: Record<string, string>;
@@ -473,11 +516,34 @@ function toImageSnapshot(raw: Record<string, unknown>): ImageSnapshotRecord {
   return record;
 }
 
+/** The backend's rules for `workload` and `tenant`, checked here so a bad value fails before the request. */
+const MAX_ATTRIBUTE_LENGTH = 1024;
+const WORKLOAD_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
+const TENANT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+function checkAttribute(name: string, value: string, pattern: RegExp, letters: string): void {
+  if (value.length > MAX_ATTRIBUTE_LENGTH) {
+    throw new TypeError(`${name} is longer than ${MAX_ATTRIBUTE_LENGTH} characters`);
+  }
+  if (!pattern.test(value)) {
+    throw new TypeError(
+      `${name} must be ${letters}, digits, ".", "_" and "-", starting with a letter or digit`,
+    );
+  }
+}
+
 function toCreateBody(options: SandboxCreateOptions): Record<string, unknown> {
   const body: Record<string, unknown> = {};
   if (options.image !== undefined) body.image = options.image;
   else if (options.baseImage !== undefined) body.base_image = options.baseImage;
   else throw new TypeError("image is required");
+  if (!options.workload) throw new TypeError("workload is required");
+  checkAttribute("workload", options.workload, WORKLOAD_PATTERN, "lowercase letters");
+  body.workload = options.workload;
+  if (options.tenant !== undefined) {
+    checkAttribute("tenant", options.tenant, TENANT_PATTERN, "letters");
+    body.tenant = options.tenant;
+  }
   if (options.arch !== undefined) body.arch = options.arch;
   if (options.vcpu !== undefined) body.vcpu = options.vcpu;
   if (options.env !== undefined) body.env = options.env;
@@ -505,6 +571,8 @@ function toRecord(raw: Record<string, unknown>): SandboxRecord {
     raw,
   };
   if (data.hostname !== undefined) record.hostname = data.hostname;
+  if (data.workload !== undefined) record.workload = data.workload;
+  if (data.tenant !== undefined) record.tenant = data.tenant;
   if (data.image !== undefined) record.image = data.image;
   else if (data.base_image !== undefined) record.image = data.base_image;
   if (data.hostnames !== undefined) record.hostnames = data.hostnames;

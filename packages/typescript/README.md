@@ -17,7 +17,7 @@ npm install @useblacksmith/sandbox
 import { HttpControlPlaneClient, Sandbox } from "@useblacksmith/sandbox";
 
 const cp = new HttpControlPlaneClient({ apiKey: process.env.BLACKSMITH_API_KEY! });
-const sandbox = await Sandbox.create(cp, { image: "ubuntu-24.04" });
+const sandbox = await Sandbox.create(cp, { image: "ubuntu-24.04", workload: "ci-repro" });
 
 const { exit_code, timed_out, stdout } = await sandbox.exec({ cmd: ["uname", "-a"] });
 console.log(timed_out ? "timed out" : exit_code, stdout);
@@ -39,6 +39,28 @@ for await (const chunk of sandbox.streamOutput("build", { follow: true })) {
 
 await sandbox.delete();
 ```
+
+## Workload and tenant
+
+`create` requires `workload`: the kind of work this sandbox does, such as
+`agent-session`, `test-runner` or `pr-review`. Blacksmith reports usage per
+workload, so a clear, stable name lets you see what each kind of work costs.
+Keep the set small and reuse values: a name used by one sandbox tells you
+nothing.
+
+`tenant` is optional: whose work this is, when you run sandboxes on behalf of
+your own customers or teams, such as `acme`. Use a stable id or name, and
+always send it in the same form. Leave it out when every sandbox is your own.
+
+```ts
+await Sandbox.create(cp, { image: "ubuntu-24.04", workload: "test-runner", tenant: "acme" });
+```
+
+Both are letters, digits, `.`, `_` and `-`, start with a letter or digit, and
+are at most 1024 characters; `workload` is lowercase only. `create` throws
+a `TypeError` for a value that breaks these rules before any request is sent. The record returns
+them as `workload` and `tenant`. Anything that differs per sandbox (a session
+id, a branch) belongs in `labels`.
 
 ## Exposed ports
 
@@ -116,7 +138,7 @@ while (state === "pausing") {
 }
 const snapshot = await cp.images.snapshots.create({ sandbox: sandbox.id, ttlSeconds: 86_400 });
 
-const child = await Sandbox.create(cp, { image: snapshot.id });
+const child = await Sandbox.create(cp, { image: snapshot.id, workload: "ci-repro" });
 
 await cp.images.snapshots.list({ state: "ready" });
 await cp.images.snapshots.delete(snapshot.id);

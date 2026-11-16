@@ -32,6 +32,8 @@ describe("HttpControlPlaneClient", () => {
   it("creates with a snake_case body, bearer auth and Idempotency-Key", async () => {
     const record = await client().create({
       image: "ubuntu-24.04",
+      workload: "pr-diff",
+      tenant: "Acme",
       vcpu: 4,
       labels: ["ci"],
       idleTimeoutSeconds: 600,
@@ -46,6 +48,8 @@ describe("HttpControlPlaneClient", () => {
       idempotencyKey: "req-1",
       body: {
         image: "ubuntu-24.04",
+        workload: "pr-diff",
+        tenant: "Acme",
         vcpu: 4,
         labels: ["ci"],
         idle_timeout_seconds: 600,
@@ -54,6 +58,8 @@ describe("HttpControlPlaneClient", () => {
     });
     expect(record.id).toMatch(/^sbx-/);
     expect(record.state).toBe("running");
+    expect(record.workload).toBe("pr-diff");
+    expect(record.tenant).toBe("Acme");
     expect(record.hostname).toBe(`${record.id}.sandboxes.test`);
     expect(record.hostnames).toEqual([
       `${record.id}.sandboxes.test`,
@@ -65,7 +71,11 @@ describe("HttpControlPlaneClient", () => {
     expect(record.token?.expiresAt.getTime()).toBeGreaterThan(Date.now());
     expect(record.replayed).toBe(false);
 
-    const replay = await client().create({ image: "ubuntu-24.04", idempotencyKey: "req-1" });
+    const replay = await client().create({
+      image: "ubuntu-24.04",
+      workload: "test",
+      idempotencyKey: "req-1",
+    });
     expect(replay.id).toBe(record.id);
     expect(replay.token).toBeUndefined();
     expect(replay.replayed).toBe(true);
@@ -83,7 +93,7 @@ describe("HttpControlPlaneClient", () => {
         return Response.json({ ...body, token: { token: "tok-x" } }, { status: response.status });
       },
     });
-    await expect(broken.create({ baseImage: "ubuntu-24.04" })).rejects.toThrow(
+    await expect(broken.create({ baseImage: "ubuntu-24.04", workload: "test" })).rejects.toThrow(
       "control plane token response is missing token, expires_at or hostname",
     );
   });
@@ -195,7 +205,7 @@ describe("HttpControlPlaneClient", () => {
     expect(err).toMatchObject({ status: 404, code: "not_found" });
 
     const invalid = await client()
-      .create({ image: "" })
+      .create({ image: "", workload: "test" })
       .catch((e: unknown) => e);
     expect(invalid).toMatchObject({
       status: 400,
@@ -232,7 +242,9 @@ describe("HttpControlPlaneClient", () => {
           { status: 503 },
         ),
     });
-    const err = await c.create({ baseImage: "ubuntu-24.04", vcpu: 4 }).catch((e: unknown) => e);
+    const err = await c
+      .create({ baseImage: "ubuntu-24.04", workload: "test", vcpu: 4 })
+      .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ControlPlaneError);
     expect(err).toMatchObject({
       status: 503,
@@ -260,7 +272,9 @@ describe("HttpControlPlaneClient", () => {
       baseUrl: "https://control-plane.test",
       fetch,
     });
-    const err = await c.create({ image: "ubuntu-24.04", vcpu: 2 }).catch((e: unknown) => e);
+    const err = await c
+      .create({ image: "ubuntu-24.04", workload: "test", vcpu: 2 })
+      .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ControlPlaneError);
     expect(err).toMatchObject({ status: 429, code: "concurrency_limit", retryAfterMs: 15_000 });
     expect(concurrencyLimit(err)).toEqual({
@@ -347,19 +361,63 @@ describe("HttpControlPlaneClient", () => {
   });
 
   it("still sends the deprecated baseImage as base_image", async () => {
-    const record = await client().create({ baseImage: "ubuntu-24.04" });
+    const record = await client().create({ baseImage: "ubuntu-24.04", workload: "test" });
     expect(cp.requests[0]).toMatchObject({ body: { base_image: "ubuntu-24.04" } });
     expect(cp.requests[0]?.body).not.toHaveProperty("image");
     expect(record.image).toBe("ubuntu-24.04");
   });
 
   it("prefers image over baseImage and requires one of them", async () => {
-    await client().create({ image: "ubuntu-24.04", baseImage: "ignored" });
+    await client().create({ image: "ubuntu-24.04", workload: "test", baseImage: "ignored" });
     expect(cp.requests[0]).toMatchObject({ body: { image: "ubuntu-24.04" } });
     expect(cp.requests[0]?.body).not.toHaveProperty("base_image");
     // @ts-expect-error one of image/baseImage is required at the type level too
     await expect(client().create({ vcpu: 2 })).rejects.toThrow(TypeError);
     expect(cp.requests).toHaveLength(1);
+  });
+
+  it("leaves tenant out of the body when none is given", async () => {
+    await client().create({ image: "ubuntu-24.04", workload: "test" });
+    expect(cp.requests[0]?.body).not.toHaveProperty("tenant");
+  });
+
+  it("refuses a workload or tenant longer than 1024 characters", async () => {
+    const atLimit = "a".repeat(1024);
+    await client().create({ image: "ubuntu-24.04", workload: atLimit, tenant: atLimit });
+    expect(cp.requests).toHaveLength(1);
+
+    await expect(
+      client().create({ image: "ubuntu-24.04", workload: `${atLimit}a` }),
+    ).rejects.toThrow("workload is longer than 1024 characters");
+    await expect(
+      client().create({ image: "ubuntu-24.04", workload: "test", tenant: `${atLimit}a` }),
+    ).rejects.toThrow("tenant is longer than 1024 characters");
+    expect(cp.requests).toHaveLength(1);
+  });
+
+  it("refuses a malformed workload or tenant before sending anything", async () => {
+    for (const workload of ["PR-Diff", "pr diff", "-pr-diff", "pr/diff"]) {
+      await expect(client().create({ image: "ubuntu-24.04", workload })).rejects.toThrow(
+        "workload must be lowercase letters",
+      );
+    }
+    for (const tenant of ["acme corp", "-acme", "acme/eu", ""]) {
+      await expect(
+        client().create({ image: "ubuntu-24.04", workload: "test", tenant }),
+      ).rejects.toThrow("tenant must be letters");
+    }
+    expect(cp.requests).toHaveLength(0);
+
+    await client().create({ image: "ubuntu-24.04", workload: "pr-diff.v2_x", tenant: "Acme-Corp" });
+    expect(cp.requests).toHaveLength(1);
+  });
+
+  it("refuses to create without a workload", async () => {
+    // @ts-expect-error workload is required at the type level too
+    await expect(client().create({ image: "ubuntu-24.04" })).rejects.toThrow(
+      "workload is required",
+    );
+    expect(cp.requests).toHaveLength(0);
   });
 });
 
@@ -407,7 +465,7 @@ describe("HttpControlPlaneClient.images.snapshots", () => {
 
   it("creates a sandbox from a snapshot and refuses to snapshot that sandbox", async () => {
     const snapshot = cp.seedSnapshot(cp.seed("paused"));
-    const child = await client().create({ image: snapshot.id, vcpu: 2 });
+    const child = await client().create({ image: snapshot.id, workload: "test", vcpu: 2 });
     expect(cp.requests[0]).toMatchObject({ body: { image: snapshot.id, vcpu: 2 } });
     expect(child.image).toBe(snapshot.id);
 
@@ -420,7 +478,7 @@ describe("HttpControlPlaneClient.images.snapshots", () => {
 
   it("surfaces unknown_image for a missing snapshot id", async () => {
     const error = await client()
-      .create({ image: "snap-doesnotexist" })
+      .create({ image: "snap-doesnotexist", workload: "test" })
       .catch((e: unknown) => e);
     expect(error).toMatchObject({ status: 422, code: "unknown_image" });
   });
