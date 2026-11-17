@@ -7,6 +7,8 @@ export interface StoredSandbox {
   hostname: string;
   hostnames: string[];
   created_at: string;
+  workload?: string;
+  tenant?: string;
   image: string;
   base_image: string;
   labels: string[];
@@ -272,6 +274,8 @@ export class FakeControlPlane {
     const record = this.seed("running");
     record.image = image;
     record.base_image = image;
+    if (typeof input.workload === "string") record.workload = input.workload;
+    if (typeof input.tenant === "string") record.tenant = input.tenant;
     record.labels = Array.isArray(input.labels) ? (input.labels as string[]) : [];
     if (typeof input.idle_delete_timeout_seconds === "number")
       record.idle_delete_timeout_seconds = input.idle_delete_timeout_seconds;
