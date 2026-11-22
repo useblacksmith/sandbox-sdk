@@ -1,7 +1,8 @@
 name: Disk benchmark
 
 # fio suite for the runner's root disk, on stock runners and on a Blacksmith Machine
-# Image, for comparing against the same suite run inside a sandbox. Runs on demand and on pull requests that change this file.
+# Image, for comparing against the same suite run inside a sandbox. Runs on demand
+# and on pull requests that change this file.
 on:
   workflow_dispatch:
     inputs:
