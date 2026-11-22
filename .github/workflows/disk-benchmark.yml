@@ -1,0 +1,137 @@
+name: Disk benchmark
+
+# fio suite for the runner's root disk, for comparing against the same suite run
+# inside a sandbox. Runs on demand and on pull requests that change this file.
+on:
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: Rounds of the suite. The summary reports the median.
+        default: "3"
+  pull_request:
+    paths:
+      - ".github/workflows/disk-benchmark.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  fio:
+    name: fio (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - blacksmith-2vcpu-ubuntu-2404
+          - blacksmith-4vcpu-ubuntu-2404
+    defaults:
+      run:
+        shell: bash
+    env:
+      RUNNER_LABEL: ${{ matrix.runner }}
+      ROUNDS: ${{ inputs.rounds || '3' }}
+      RUNTIME: "15"
+      SIZE: 2G
+    steps:
+      - name: Install fio
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fio
+          fio --version
+
+      - name: Run fio suite
+        run: |
+          out=$RUNNER_TEMP/fio-results
+          file=$RUNNER_TEMP/fio-testfile
+          mkdir -p "$out/raw"
+
+          dev=$(df --output=source "$RUNNER_TEMP" | tail -1)
+          disk=$(lsblk -no PKNAME "$dev" 2>/dev/null | head -1 || true)
+          disk=${disk:-$(basename "$dev")}
+          jq -n \
+            --arg runner "$RUNNER_LABEL" \
+            --arg cpu "$(lscpu | sed -n 's/^Model name: *//p' | head -1)" \
+            --argjson vcpu "$(nproc)" \
+            --argjson memory_gb "$(awk '/MemTotal/ {printf "%.1f", $2 / 1048576}' /proc/meminfo)" \
+            --arg kernel "$(uname -r)" \
+            --arg fio "$(fio --version)" \
+            --arg device "$dev" \
+            --arg fs "$(df --output=fstype "$RUNNER_TEMP" | tail -1)" \
+            --arg mount_options "$(findmnt -no OPTIONS --target "$RUNNER_TEMP")" \
+            --arg write_cache "$(cat "/sys/block/$disk/queue/write_cache" 2>/dev/null || echo unknown)" \
+            '$ARGS.named' | tee "$out/machine.json"
+
+          # Lay the file out with real writes first so no test pays first-allocation cost.
+          fio --name=prefill --filename="$file" --size="$SIZE" --direct=1 --ioengine=libaio \
+            --rw=write --bs=1M --iodepth=8 --end_fsync=1 --output-format=json --output="$out/prefill.json"
+
+          tests=(
+            "randread_4k_qd32|--rw=randread --bs=4k --iodepth=32"
+            "randwrite_4k_qd32|--rw=randwrite --bs=4k --iodepth=32"
+            "randrw_4k_qd32|--rw=randrw --rwmixread=70 --bs=4k --iodepth=32"
+            "randread_4k_qd1|--rw=randread --bs=4k --iodepth=1"
+            "randwrite_4k_qd1|--rw=randwrite --bs=4k --iodepth=1"
+            "randwrite_4k_fsync|--rw=randwrite --bs=4k --iodepth=1 --fsync=1"
+            "seqread_1m_qd8|--rw=read --bs=1M --iodepth=8"
+            "seqwrite_1m_qd8|--rw=write --bs=1M --iodepth=8"
+          )
+          for round in $(seq 1 "$ROUNDS"); do
+            for t in "${tests[@]}"; do
+              name=${t%%|*}
+              read -ra flags <<< "${t#*|}"
+              fio --name="$name" --filename="$file" --size="$SIZE" --direct=1 --ioengine=libaio \
+                --time_based --runtime="$RUNTIME" --ramp_time=2 --numjobs=1 --group_reporting \
+                --randrepeat=0 --norandommap "${flags[@]}" \
+                --output-format=json --output="$out/raw/$name.$round.json"
+              jq -r --arg round "$round" '.jobs[0] |
+                "round \($round) \(.jobname): \(.read.iops + .write.iops | round) IOPS, \((.read.bw_bytes + .write.bw_bytes) / 1e6 | round) MB/s"' \
+                "$out/raw/$name.$round.json"
+            done
+          done
+          rm -f "$file"
+
+      - name: Summarize
+        run: |
+          out=$RUNNER_TEMP/fio-results
+          jq -s '
+            def median: sort | .[length / 2 | floor];
+            def latency($p): [.read.clat_ns.percentile[$p] // 0, .write.clat_ns.percentile[$p] // 0] | max / 1000;
+            map(.jobs[0]) | group_by(.jobname) | map({
+              test: .[0].jobname,
+              iops: (map(.read.iops + .write.iops) | median),
+              iops_min: (map(.read.iops + .write.iops) | min),
+              iops_max: (map(.read.iops + .write.iops) | max),
+              mbps: (map((.read.bw_bytes + .write.bw_bytes) / 1e6) | median),
+              p50_us: (map(latency("50.000000")) | median),
+              p99_us: (map(latency("99.000000")) | median),
+              fio_cpu_pct: (map(.usr_cpu + .sys_cpu) | median),
+              fsync_p50_us: (
+                map(select((.sync.total_ios // 0) > 0) | .sync.lat_ns.percentile["50.000000"] / 1000)
+                | if length > 0 then median else null end
+              )
+            })
+          ' "$out"/raw/*.json > "$out/summary.json"
+
+          {
+            echo "### fio on \`$RUNNER_LABEL\`"
+            echo
+            jq -r '"\(.vcpu) vCPU, \(.memory_gb) GB, \(.cpu). \(.fs) on `\(.device)`, write cache `\(.write_cache)`, mounted `\(.mount_options)`. Kernel \(.kernel), \(.fio)."' "$out/machine.json"
+            echo
+            echo "Median of $ROUNDS rounds, ${RUNTIME}s each after a 2s ramp. Direct I/O on a prefilled $SIZE file, one job."
+            echo
+            echo "| Test | IOPS | IOPS min to max | MB/s | p50 µs | p99 µs | fio CPU % | fsync p50 µs |"
+            echo "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+            jq -r '.[] |
+              "| \(.test) | \(.iops | round) | \(.iops_min | round) to \(.iops_max | round) | \(.mbps | round) | \(.p50_us | round) | \(.p99_us | round) | \(.fio_cpu_pct | round) | \(if .fsync_p50_us then (.fsync_p50_us | round) else "" end) |"' \
+              "$out/summary.json"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fio-${{ matrix.runner }}
+          path: ${{ runner.temp }}/fio-results
