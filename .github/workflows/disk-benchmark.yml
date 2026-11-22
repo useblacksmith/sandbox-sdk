@@ -76,13 +76,15 @@ jobs:
           fio --name=prefill --filename="$file" --size="$SIZE" --direct=1 --ioengine=libaio \
             --rw=write --bs=1M --iodepth=8 --end_fsync=1 --output-format=json --output="$out/prefill.json"
 
+          # psync for the fsync test: libaio runs fsync inline without stamping its issue
+          # time, so fio would report the fsync latency from the preceding write's start.
           tests=(
             "randread_4k_qd32|--rw=randread --bs=4k --iodepth=32"
             "randwrite_4k_qd32|--rw=randwrite --bs=4k --iodepth=32"
-            "randrw_4k_qd32|--rw=randrw --rwmixread=70 --bs=4k --iodepth=32"
+            "randrw_4k_qd32|--rw=randrw --rwmixread=70 --bs=4k --iodepth=32 --unified_rw_reporting=both"
             "randread_4k_qd1|--rw=randread --bs=4k --iodepth=1"
             "randwrite_4k_qd1|--rw=randwrite --bs=4k --iodepth=1"
-            "randwrite_4k_fsync|--rw=randwrite --bs=4k --iodepth=1 --fsync=1"
+            "randwrite_4k_fsync|--rw=randwrite --bs=4k --iodepth=1 --fsync=1 --ioengine=psync"
             "seqread_1m_qd8|--rw=read --bs=1M --iodepth=8"
             "seqwrite_1m_qd8|--rw=write --bs=1M --iodepth=8"
           )
@@ -105,8 +107,13 @@ jobs:
         run: |
           out=$RUNNER_TEMP/fio-results
           jq -s '
-            def median: sort | .[length / 2 | floor];
-            def latency($p): [.read.clat_ns.percentile[$p] // 0, .write.clat_ns.percentile[$p] // 0] | max / 1000;
+            def median:
+              sort | (length / 2 | floor) as $mid |
+              if length % 2 == 0 then (.[$mid - 1] + .[$mid]) / 2 else .[$mid] end;
+            # The mixed test reports a combined distribution; the others have one active direction.
+            def latency($p):
+              (.mixed.clat_ns.percentile[$p]
+                // ([.read.clat_ns.percentile[$p] // 0, .write.clat_ns.percentile[$p] // 0] | max)) / 1000;
             map(.jobs[0]) | group_by(.jobname) | map({
               test: .[0].jobname,
               iops: (map(.read.iops + .write.iops) | median),
