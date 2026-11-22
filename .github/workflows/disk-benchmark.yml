@@ -1,7 +1,7 @@
 name: Disk benchmark
 
-# fio suite for the runner's root disk, for comparing against the same suite run
-# inside a sandbox. Runs on demand and on pull requests that change this file.
+# fio suite for the runner's root disk, on stock runners and on a Blacksmith Machine
+# Image, for comparing against the same suite run inside a sandbox. Runs on demand and on pull requests that change this file.
 on:
   workflow_dispatch:
     inputs:
@@ -29,6 +29,9 @@ jobs:
         runner:
           - blacksmith-2vcpu-ubuntu-2404
           - blacksmith-4vcpu-ubuntu-2404
+          # The same sizes on the `web` Blacksmith Machine Image.
+          - blacksmith-2vcpu-bmi-web
+          - blacksmith-4vcpu-bmi-web
     defaults:
       run:
         shell: bash
@@ -40,8 +43,10 @@ jobs:
     steps:
       - name: Install fio
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq fio
+          if ! command -v fio > /dev/null; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq fio
+          fi
           fio --version
 
       - name: Run fio suite
