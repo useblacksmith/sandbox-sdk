@@ -90,9 +90,26 @@ export interface AttachDiskResult {
 
 export interface StreamOutputOptions extends StreamRequestOptions {
   stream?: "stdout" | "stderr" | "both";
+  /**
+   * Keep the stream open until the process exits. Defaults to `true`; pass
+   * `false` to get the lines printed so far and stop.
+   */
+  follow?: boolean;
+}
+
+/** One line of process output, without its line ending. */
+export interface OutputLine {
+  stream: "stdout" | "stderr";
+  text: string;
+}
+
+export interface StreamOutputRawOptions extends StreamRequestOptions {
+  stream?: "stdout" | "stderr" | "both";
+  /** Start `stdout` at this byte offset instead of the beginning. */
   stdoutFrom?: number;
+  /** Start `stderr` at this byte offset instead of the beginning. */
   stderrFrom?: number;
-  /** Keep the stream open until the process exits. */
+  /** Keep the stream open until the process exits. Defaults to `false`. */
   follow?: boolean;
 }
 

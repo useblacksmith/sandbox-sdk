@@ -13,6 +13,7 @@ import type {
   SandboxRecord,
 } from "./control-plane.js";
 import { SandboxApiError, SandboxError, SandboxTransportError, isSandboxGone } from "./errors.js";
+import { toLines } from "./lines.js";
 import { sandboxTokens, type SandboxTokens, type SharedToken } from "./token-cache.js";
 import type { Disk, ExecResponse, FileInfo, PortExposure, Process } from "./generated/types.gen.js";
 import type { TokenProvider } from "./token.js";
@@ -23,11 +24,13 @@ import type {
   FileContent,
   FileStream,
   OutputChunk,
+  OutputLine,
   ProcessSpecInput,
   ExecOptions,
   RequestOptions,
   StartProcessResult,
   StreamOutputOptions,
+  StreamOutputRawOptions,
   StreamRequestOptions,
   WriteFileBody,
   WriteFileOptions,
@@ -331,13 +334,26 @@ export class Sandbox {
   }
 
   /**
-   * Like `SandboxClient.streamOutput`, but a transport failure mid-stream
+   * Yields the process's output one line of text at a time, until it exits
+   * (or, with `follow: false`, until the output so far is delivered). A
+   * dropped connection is resumed where it stopped, so no line is repeated
+   * or lost.
+   */
+  streamOutput(
+    id: string,
+    options: StreamOutputOptions = {},
+  ): AsyncGenerator<OutputLine, void, undefined> {
+    return toLines(this.streamOutputRaw(id, { follow: true, ...options }));
+  }
+
+  /**
+   * Like `SandboxClient.streamOutputRaw`, but a transport failure mid-stream
    * re-checks the control plane and, if still running, resumes once from the
    * last delivered offsets.
    */
-  async *streamOutput(
+  async *streamOutputRaw(
     id: string,
-    options: StreamOutputOptions = {},
+    options: StreamOutputRawOptions = {},
   ): AsyncGenerator<OutputChunk, void, undefined> {
     let stdoutFrom = options.stdoutFrom;
     let stderrFrom = options.stderrFrom;
@@ -345,7 +361,7 @@ export class Sandbox {
     let goneReplays = 0;
     for (;;) {
       try {
-        for await (const chunk of this.client.streamOutput(id, {
+        for await (const chunk of this.client.streamOutputRaw(id, {
           ...options,
           stdoutFrom,
           stderrFrom,

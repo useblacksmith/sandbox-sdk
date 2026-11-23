@@ -94,12 +94,12 @@ describe("activity", () => {
       state: "running",
     });
     const chunks: OutputChunk[] = [];
-    for await (const chunk of c.streamOutput("process-1", { activity: "active" }))
+    for await (const chunk of c.streamOutputRaw("process-1", { activity: "active" }))
       chunks.push(chunk);
     expect(decode(chunks, "stdout")).toBe("ready\n");
     await c.getProcess("process-1");
     const passiveChunks: OutputChunk[] = [];
-    for await (const chunk of c.streamOutput("process-1")) passiveChunks.push(chunk);
+    for await (const chunk of c.streamOutputRaw("process-1")) passiveChunks.push(chunk);
     expect(decode(passiveChunks, "stdout")).toBe("ready\n");
     expect(requests).toEqual([
       { path: "/v1/processes/process-1", activity: "active" },
@@ -506,7 +506,7 @@ describe("processes", () => {
     const c = client();
     await c.startProcess("slow", { shell: "sleep 30", timeoutSeconds: 1 });
     const chunks: OutputChunk[] = [];
-    for await (const chunk of c.streamOutput("slow", { follow: true })) chunks.push(chunk);
+    for await (const chunk of c.streamOutputRaw("slow", { follow: true })) chunks.push(chunk);
     expect(chunks.at(-1)).toMatchObject({ type: "exit", state: "killed", timedOut: true });
     await c.killProcess("slow");
   });
@@ -676,6 +676,36 @@ describe("disks", () => {
 });
 
 describe("streamOutput", () => {
+  it("yields lines of text from both streams until the process exits", async () => {
+    const c = client();
+    await c.startProcess("lines", {
+      shell: "echo one; sleep 0.2; echo two >&2; sleep 0.2; printf 'three\\nfour'",
+    });
+    const lines = [];
+    for await (const line of c.streamOutput("lines")) lines.push(line);
+    expect(lines).toEqual([
+      { stream: "stdout", text: "one" },
+      { stream: "stderr", text: "two" },
+      { stream: "stdout", text: "three" },
+      { stream: "stdout", text: "four" },
+    ]);
+    expect(agent.requests.at(-1)?.path).toContain("follow=true");
+    await c.killProcess("lines");
+  });
+
+  it("stops at the output so far with follow=false and honours stream=", async () => {
+    const c = client();
+    await c.startProcess("partial", { shell: "echo out; echo err >&2; sleep 30" });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const lines = [];
+    for await (const line of c.streamOutput("partial", { follow: false, stream: "stderr" }))
+      lines.push(line);
+    expect(lines).toEqual([{ stream: "stderr", text: "err" }]);
+    await c.killProcess("partial");
+  });
+});
+
+describe("streamOutputRaw", () => {
   it("yields chunks incrementally with follow=true and ends with exit", async () => {
     const c = client();
     await c.startProcess("ticker", {
@@ -683,7 +713,7 @@ describe("streamOutput", () => {
     });
     const seenAt: number[] = [];
     const chunks: OutputChunk[] = [];
-    for await (const chunk of c.streamOutput("ticker", { follow: true })) {
+    for await (const chunk of c.streamOutputRaw("ticker", { follow: true })) {
       chunks.push(chunk);
       seenAt.push(Date.now());
     }
@@ -704,11 +734,11 @@ describe("streamOutput", () => {
     const c = client();
     await c.startProcess("offsets", { shell: "printf abcdef; printf XY >&2" });
     const all: OutputChunk[] = [];
-    for await (const chunk of c.streamOutput("offsets", { follow: true })) all.push(chunk);
+    for await (const chunk of c.streamOutputRaw("offsets", { follow: true })) all.push(chunk);
     expect(decode(all, "stdout")).toBe("abcdef");
 
     const resumed: OutputChunk[] = [];
-    for await (const chunk of c.streamOutput("offsets", { stdoutFrom: 4, stream: "stdout" }))
+    for await (const chunk of c.streamOutputRaw("offsets", { stdoutFrom: 4, stream: "stdout" }))
       resumed.push(chunk);
     expect(resumed[0]).toMatchObject({ type: "stdout", offset: 4 });
     expect(decode(resumed, "stdout")).toBe("ef");
@@ -721,7 +751,7 @@ describe("streamOutput", () => {
     const c = client();
     await c.startProcess("forever", { shell: "echo hi; sleep 30" });
     const controller = new AbortController();
-    const iterator = c.streamOutput("forever", { follow: true, signal: controller.signal });
+    const iterator = c.streamOutputRaw("forever", { follow: true, signal: controller.signal });
     const first = await iterator.next();
     expect(first.value).toMatchObject({ type: "stdout" });
     controller.abort();
@@ -735,7 +765,7 @@ describe("streamOutput", () => {
     const c = client();
     const controller = new AbortController();
     await c.startProcess("brief", { shell: "echo hi" });
-    for await (const _ of c.streamOutput("brief", { follow: true, signal: controller.signal }));
+    for await (const _ of c.streamOutputRaw("brief", { follow: true, signal: controller.signal }));
     await c.writeFile("/brief.txt", "hi");
     const { stream } = await c.readFileStream("/brief.txt", { signal: controller.signal });
     for await (const _ of stream);
@@ -746,7 +776,7 @@ describe("streamOutput", () => {
   });
 
   it("maps a missing process to not_found before yielding", async () => {
-    const iterator = client().streamOutput("nope");
+    const iterator = client().streamOutputRaw("nope");
     await expect(iterator.next()).rejects.toMatchObject({ code: "not_found" });
   });
 
@@ -762,7 +792,7 @@ describe("streamOutput", () => {
       },
     });
     await c.startProcess("quiet", { shell: "echo hi" });
-    for await (const _ of c.streamOutput("quiet", { follow: true }));
+    for await (const _ of c.streamOutputRaw("quiet", { follow: true }));
     await c.writeFile("/quiet.txt", "hi");
     for await (const _ of (await c.readFileStream("/quiet.txt")).stream);
     await c.readFile("/quiet.txt");
@@ -780,7 +810,7 @@ describe("streamOutput", () => {
     const c = client();
     await c.startProcess("stalled", { shell: "echo hi; sleep 30" });
     agent.faults.push("stall");
-    const iterator = c.streamOutput("stalled", { follow: true, idleTimeoutMs: 100 });
+    const iterator = c.streamOutputRaw("stalled", { follow: true, idleTimeoutMs: 100 });
     expect((await iterator.next()).value).toMatchObject({ type: "stdout" });
     const error = await iterator.next().catch((e: unknown) => e);
     expect(error).toBeInstanceOf(SandboxTransportError);
@@ -793,7 +823,7 @@ describe("streamOutput", () => {
     await c.startProcess("garbage", { shell: "echo hi" });
     agent.faults.push("garbage-event");
     const error = await (async () => {
-      for await (const _ of c.streamOutput("garbage"));
+      for await (const _ of c.streamOutputRaw("garbage"));
     })().catch((e: unknown) => e);
     expect(error).toBeInstanceOf(SandboxTransportError);
     expect((error as SandboxTransportError).cause).toMatchObject({
@@ -807,7 +837,7 @@ describe("streamOutput", () => {
     const c = client();
     await c.startProcess("busy", { shell: "echo hi; sleep 30" });
     agent.faults.push("stall");
-    const iterator = c.streamOutput("busy", { follow: true, idleTimeoutMs: 100 });
+    const iterator = c.streamOutputRaw("busy", { follow: true, idleTimeoutMs: 100 });
     expect((await iterator.next()).value).toMatchObject({ type: "stdout" });
     await new Promise((resolve) => setTimeout(resolve, 300));
     const resumedAt = Date.now();
@@ -821,7 +851,7 @@ describe("streamOutput", () => {
     const c = client();
     await c.startProcess("drip", { shell: "echo a; sleep 0.15; echo b; sleep 0.15; echo c" });
     const chunks: OutputChunk[] = [];
-    for await (const chunk of c.streamOutput("drip", { follow: true, idleTimeoutMs: 1_000 }))
+    for await (const chunk of c.streamOutputRaw("drip", { follow: true, idleTimeoutMs: 1_000 }))
       chunks.push(chunk);
     expect(decode(chunks, "stdout")).toBe("a\nb\nc\n");
     await c.killProcess("drip");

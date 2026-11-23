@@ -10,6 +10,7 @@ import type {
   ProcessList,
 } from "./generated/types.gen.js";
 import { SandboxApiError, SandboxTransportError, isSandboxGone } from "./errors.js";
+import { toLines } from "./lines.js";
 import { parseNdjson } from "./ndjson.js";
 import { TokenSource, type TokenProvider } from "./token.js";
 import {
@@ -24,11 +25,13 @@ import {
   type FileStream,
   type OutputChunk,
   type OutputExitChunk,
+  type OutputLine,
   type ExecOptions,
   type ProcessSpecInput,
   type RequestOptions,
   type StartProcessResult,
   type StreamOutputOptions,
+  type StreamOutputRawOptions,
   type StreamRequestOptions,
   type WriteFileBody,
   type WriteFileOptions,
@@ -281,7 +284,7 @@ export class SandboxClient {
     let truncated = false;
     for (let attempt = 1; ; attempt++) {
       try {
-        for await (const chunk of this.streamOutput(id, {
+        for await (const chunk of this.streamOutputRaw(id, {
           ...request,
           follow: true,
           stdoutFrom: from.stdout,
@@ -319,11 +322,28 @@ export class SandboxClient {
   }
 
   /**
-   * Yields output chunks as the agent emits them. With `follow`, the stream
-   * stays open until the `exit` chunk. A transport failure mid-stream throws
-   * `SandboxTransportError`; resume from the last seen offsets.
+   * Yields the process's output one line of text at a time, until it exits
+   * (or, with `follow: false`, until the output so far is delivered). A
+   * transport failure mid-stream throws `SandboxTransportError`;
+   * `Sandbox.streamOutput` resumes for you.
    */
-  async *streamOutput(id: string, options: StreamOutputOptions = {}): AsyncGenerator<OutputChunk> {
+  streamOutput(
+    id: string,
+    options: StreamOutputOptions = {},
+  ): AsyncGenerator<OutputLine, void, undefined> {
+    return toLines(this.streamOutputRaw(id, { follow: true, ...options }));
+  }
+
+  /**
+   * Yields output as the agent emits it: byte chunks with their offsets, a
+   * `gap` for bytes dropped before delivery and, with `follow`, a final
+   * `exit`. A transport failure mid-stream throws `SandboxTransportError`;
+   * resume from the last seen offsets.
+   */
+  async *streamOutputRaw(
+    id: string,
+    options: StreamOutputRawOptions = {},
+  ): AsyncGenerator<OutputChunk> {
     const { stream, stdoutFrom, stderrFrom, follow, idleTimeoutMs, ...request } = options;
     const { response, release, idle } = await this.send({
       method: "GET",

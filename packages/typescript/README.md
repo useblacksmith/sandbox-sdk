@@ -32,10 +32,8 @@ await sandbox.writeFile(
 );
 
 await sandbox.startProcess("build", { cmd: ["/work/build.sh"], cwd: "/work" });
-for await (const chunk of sandbox.streamOutput("build", { follow: true })) {
-  if (chunk.type === "stdout") process.stdout.write(chunk.data);
-  if (chunk.type === "exit") console.log("exit", chunk.exitCode);
-}
+for await (const line of sandbox.streamOutput("build")) console.log(line.text);
+console.log("exit", (await sandbox.getProcess("build")).exit_code);
 
 await sandbox.delete();
 ```
@@ -61,6 +59,49 @@ are at most 1024 characters; `workload` is lowercase only. `create` throws
 a `TypeError` for a value that breaks these rules before any request is sent. The record returns
 them as `workload` and `tenant`. Anything that differs per sandbox (a session
 id, a branch) belongs in `labels`.
+
+## Process output
+
+`streamOutput(id)` yields the output of a process started with `startProcess`,
+one line at a time, until the process exits. Each line is
+`{ stream: "stdout" | "stderr", text }`, with the line ending removed.
+
+```ts
+for await (const line of sandbox.streamOutput("build")) {
+  if (line.stream === "stderr") console.error(line.text);
+  else console.log(line.text);
+}
+const { state, exit_code } = await sandbox.getProcess("build");
+```
+
+Pass `stream: "stdout"` or `stream: "stderr"` to read one stream only, and
+`follow: false` to get the lines printed so far without waiting for the exit.
+Text that does not end in a newline is held until the newline arrives or the
+output ends. If the connection drops, `Sandbox.streamOutput` reconnects and
+continues where it stopped, so no line is repeated or lost.
+
+`streamOutputRaw(id, options)` is the lower-level form. Use it for output that
+is not lines of text: binary data, progress bars and prompts that do not end
+in a newline. It yields what the agent sends:
+
+- `{ type: "stdout" | "stderr", offset, data }`: bytes (`Uint8Array`) and the
+  byte offset of the first one within that stream.
+- `{ type: "gap", stream, from, to }`: the sandbox dropped bytes `[from, to)`
+  before they were delivered, because it keeps a limited amount of output per
+  process. `streamOutput` skips a gap without telling you.
+- `{ type: "exit", state, exitCode, signal, timedOut }`: last, when `follow`
+  is `true`.
+
+`follow` defaults to `false` here. `stdoutFrom` and `stderrFrom` start a
+stream at a byte offset, so you can store the offsets you have handled and
+continue from them later, for example after your own program restarts.
+
+```ts
+for await (const chunk of sandbox.streamOutputRaw("build", { follow: true, stdoutFrom: 4096 })) {
+  if (chunk.type === "stdout") process.stdout.write(chunk.data);
+  if (chunk.type === "exit") console.log("exit", chunk.exitCode);
+}
+```
 
 ## Exposed ports
 
@@ -230,7 +271,7 @@ the SDK sees a `SandboxTransportError` and tries again.
 `Sandbox` adds the "which side am I talking to" re-check on top: after a
 transport error it calls `cp.get(id)`; if the sandbox is not `running` you get
 `SandboxNotRunningError`, otherwise the call is retried once (and
-`streamOutput` resumes from the last delivered byte offsets; `exec` keeps its
+`streamOutput` and `streamOutputRaw` resume from the last delivered byte offsets; `exec` keeps its
 process id). `Sandbox.connect` on a `paused` sandbox returns without
 waiting for the agent; call `resume()` before using it. `create`/`connect` on a
 `deleting`, `deleted` or `failed` sandbox throws `SandboxNotRunningError` right
@@ -242,18 +283,18 @@ away instead of waiting for an agent that will never answer.
 the whole request. `exec` bounds each of its requests by it and the whole call
 by the process's `timeoutSeconds` plus `timeoutMs` (pass `timeoutMs` to `exec`
 to replace that), and
-for `streamOutput` / `readFileStream` it only covers time-to-headers. Once a
+for `streamOutput` / `streamOutputRaw` / `readFileStream` it only covers time-to-headers. Once a
 stream is open it stays open until the agent ends it or the caller's `signal`
 fires; pass `idleTimeoutMs` to fail the stream with `SandboxTransportError`
 (`cause.name === "TimeoutError"`) when a read waits that long for the next
 bytes. The timer only runs while the SDK is waiting on the network, so a slow
-consumer is never counted as idle, and `Sandbox.streamOutput` does not resume a
+consumer is never counted as idle, and `Sandbox` does not resume a
 stream that hit it. Stream requests are sent with `timeout: false` in the fetch
 init so Bun's own 5-minute socket idle timeout cannot cut a quiet
 `follow: true` stream; Node ignores the option.
 
 ```ts
-for await (const chunk of sandbox.streamOutput("build", { follow: true, idleTimeoutMs: 600_000 })) {
+for await (const line of sandbox.streamOutput("build", { idleTimeoutMs: 600_000 })) {
   // throws SandboxTransportError if the process prints nothing for 10 minutes
 }
 ```

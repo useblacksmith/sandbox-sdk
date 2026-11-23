@@ -40,9 +40,7 @@ console.log(exit_code, stdout);
 
 await sandbox.writeFile("/work/build.sh", "#!/bin/sh\necho building\n", { mode: 0o755, mkdirParents: true });
 await sandbox.startProcess("build", { cmd: ["/work/build.sh"], cwd: "/work" });
-for await (const chunk of sandbox.streamOutput("build", { follow: true })) {
-  if (chunk.type === "stdout") process.stdout.write(chunk.data);
-}
+for await (const line of sandbox.streamOutput("build")) console.log(line.text);
 
 await sandbox.delete();
 ```

@@ -1397,7 +1397,7 @@ describe("transport-error re-check", () => {
     agent.faults.push("sandbox_failed");
 
     const chunks: string[] = [];
-    for await (const chunk of sandbox.streamOutput(process.id, { follow: true })) {
+    for await (const chunk of sandbox.streamOutputRaw(process.id, { follow: true })) {
       if (chunk.type === "stdout") chunks.push(new TextDecoder().decode(chunk.data));
     }
     expect(chunks.join("")).toBe("tick 1\ntick 2\ntick 3\n");
@@ -1451,7 +1451,7 @@ describe("transport-error re-check", () => {
     expect(cpCalls()).toEqual([]);
   });
 
-  it("resumes streamOutput from the last delivered offsets", async () => {
+  it("resumes streamOutputRaw from the last delivered offsets", async () => {
     const sandbox = await Sandbox.create(
       controlPlane,
       { image: "ubuntu-24.04", workload: "test" },
@@ -1462,7 +1462,7 @@ describe("transport-error re-check", () => {
     agent.faults.push("cut-stream");
 
     const chunks: OutputChunk[] = [];
-    for await (const chunk of sandbox.streamOutput("p", { follow: true })) {
+    for await (const chunk of sandbox.streamOutputRaw("p", { follow: true })) {
       chunks.push(chunk);
     }
 
@@ -1476,6 +1476,27 @@ describe("transport-error re-check", () => {
     expect(outputRequests[1]).toContain("stdout_from=3");
   });
 
+  it("resumes streamOutput mid-line without repeating or losing text", async () => {
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
+    await sandbox.startProcess("l", {
+      shell: "printf 'one\\ntw'; sleep 0.3; printf 'o\\nthree\\n'",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    agent.faults.push("cut-stream");
+
+    const lines: string[] = [];
+    for await (const line of sandbox.streamOutput("l")) lines.push(line.text);
+
+    expect(lines).toEqual(["one", "two", "three"]);
+    const outputRequests = agentPaths().filter((p) => p.startsWith("/v1/processes/l/output"));
+    expect(outputRequests).toHaveLength(2);
+    expect(outputRequests[1]).toContain("stdout_from=6");
+  });
+
   it("does not resume a stream that hit the caller's idleTimeoutMs", async () => {
     const sandbox = await Sandbox.create(
       controlPlane,
@@ -1486,7 +1507,7 @@ describe("transport-error re-check", () => {
     agent.faults.push("stall");
 
     const error = await (async () => {
-      for await (const _ of sandbox.streamOutput("quiet", { follow: true, idleTimeoutMs: 100 }));
+      for await (const _ of sandbox.streamOutputRaw("quiet", { follow: true, idleTimeoutMs: 100 }));
     })().catch((e: unknown) => e);
 
     expect(error).toBeInstanceOf(SandboxTransportError);
