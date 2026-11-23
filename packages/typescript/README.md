@@ -14,10 +14,10 @@ npm install @useblacksmith/sandbox
 ## Quickstart
 
 ```ts
-import { HttpControlPlaneClient, Sandbox } from "@useblacksmith/sandbox";
+import { Blacksmith } from "@useblacksmith/sandbox";
 
-const cp = new HttpControlPlaneClient({ apiKey: process.env.BLACKSMITH_API_KEY! });
-const sandbox = await Sandbox.create(cp, { image: "ubuntu-24.04", workload: "ci-repro" });
+const bs = new Blacksmith(); // reads BLACKSMITH_API_KEY; or new Blacksmith({ apiKey })
+const sandbox = await bs.sandboxes.create({ image: "ubuntu24", workload: "ci-repro" });
 
 const { exit_code, timed_out, stdout } = await sandbox.exec({ cmd: ["uname", "-a"] });
 console.log(timed_out ? "timed out" : exit_code, stdout);
@@ -40,6 +40,10 @@ for await (const chunk of sandbox.streamOutput("build", { follow: true })) {
 await sandbox.delete();
 ```
 
+`bs.sandboxes.connect(id)` returns a handle on an existing sandbox;
+`bs.sandboxes.get(id)`, `list()` and `delete(id)` read and delete records
+without one. Create one `Blacksmith` and reuse it.
+
 ## Workload and tenant
 
 `create` requires `workload`: the kind of work this sandbox does, such as
@@ -53,7 +57,7 @@ your own customers or teams, such as `acme`. Use a stable id or name, and
 always send it in the same form. Leave it out when every sandbox is your own.
 
 ```ts
-await Sandbox.create(cp, { image: "ubuntu-24.04", workload: "test-runner", tenant: "acme" });
+await bs.sandboxes.create({ image: "ubuntu24", workload: "test-runner", tenant: "acme" });
 ```
 
 Both are letters, digits, `.`, `_` and `-`, start with a letter or digit, and
@@ -127,7 +131,6 @@ pause or a crash drops them, so re-attach after every resume.
 id (`snap-…`). A snapshot is a paused sandbox's boot disk, kept for a bounded
 time (7 days by default) so new sandboxes can start from it. The source must be
 `paused`, and a sandbox created from a snapshot cannot itself be snapshotted.
-`baseImage` still works but is deprecated; use `image`.
 
 ```ts
 // pause() returns once the request is accepted; the snapshot needs the boot disk persisted.
@@ -136,57 +139,46 @@ while (state === "pausing") {
   await new Promise((resolve) => setTimeout(resolve, 1_000));
   ({ state } = await sandbox.refresh());
 }
-const snapshot = await cp.images.snapshots.create({ sandbox: sandbox.id, ttlSeconds: 86_400 });
+const snapshot = await bs.snapshots.create({ sandbox: sandbox.id, ttlSeconds: 86_400 });
 
-const child = await Sandbox.create(cp, { image: snapshot.id, workload: "ci-repro" });
+const child = await bs.sandboxes.create({ image: snapshot.id, workload: "ci-repro" });
 
-await cp.images.snapshots.list({ state: "ready" });
-await cp.images.snapshots.delete(snapshot.id);
+await bs.snapshots.list({ state: "ready" });
+await bs.snapshots.delete(snapshot.id);
 ```
 
 A snapshot lives in the source sandbox's region and arch; children are created
 there too. After `expiresAt` the snapshot can no longer be used, and the backend
 deletes it.
 
-## Two clients
+## How it works
 
-A sandbox has two HTTP surfaces and the SDK keeps them separate:
+A sandbox has two HTTP surfaces and `Blacksmith` talks to both for you:
 
-- **Control plane** (`SandboxControlPlane`, `HttpControlPlaneClient`): the
-  Blacksmith backend. Creates, lists, pauses, resumes and deletes sandboxes and
+- **Blacksmith API**: creates, lists, pauses, resumes and deletes sandboxes and
   mints short-lived agent tokens. Authenticated with your **org API key**.
-- **Agent** (`SandboxClient`): the process inside the VM at
+- **Agent**: the process inside the VM at
   `https://<sandbox_id>.<sandbox-domain>/v1`. Runs commands and processes,
   reads and writes files, streams output. Authenticated with a **per-sandbox
-  JWT** minted by the control plane. The org API key is never sent to the agent.
+  token** minted by the Blacksmith API. The org API key is never sent to the
+  agent.
 
-`Sandbox` combines both: it takes the token from the create response (or mints
-one on `connect`), builds a `SandboxClient` and waits for `GET /health`. Use
-`SandboxClient` directly when you already hold a token
-(for example inside a job that was handed one) and don't need lifecycle calls.
-
-```ts
-import { SandboxClient } from "@useblacksmith/sandbox";
-
-const client = new SandboxClient({ hostname: "sbx-123.sandboxes.blacksmith.sh", token });
-await client.exec({ shell: "echo hi" });
-```
+A `Sandbox` handle sends lifecycle calls (`pause`, `resume`, `delete`) to the
+API and everything else straight to the agent.
 
 ## Token lifecycle
 
-Agent tokens expire (~1h). `SandboxClient` accepts either a fixed `token` or a
-`tokenProvider: () => Promise<{ token, expiresAt }>`. With a provider the client
-refreshes proactively at ~80% of the token's lifetime, and on a `401
-token_expired` it refreshes once and retries the request; it never loops.
-`Sandbox` wires `cp.mintToken(id)` in as the provider, so a long-lived
-`Sandbox` keeps working across token expiry without any caller involvement.
+Agent tokens expire (~1h). A `Sandbox` refreshes its token at ~80% of the
+token's lifetime, and on a `401 token_expired` it refreshes once and retries
+the request; it never loops. A long-lived `Sandbox` keeps working across token
+expiry without any caller involvement.
 
-`POST /api/v1/sandboxes` returns the first token as `token` and `Sandbox.create`
+`POST /api/v1/sandboxes` returns the first token as `token` and `create`
 uses it, so a create fan-out costs one control-plane call per sandbox. Only
 refreshes hit `POST /api/v1/sandboxes/{id}/tokens`, which is capped at 30 mints
 per minute per sandbox and 600 per org.
 
-Every `Sandbox` attached through the same control-plane client shares one token
+Every `Sandbox` from the same `Blacksmith` instance shares one token
 per sandbox: `connect` reuses the last token minted (or returned by create) for
 that id until ~80% of its lifetime, and concurrent mints for one id share a
 request. A 429 makes that sandbox's mints fail with the same `ControlPlaneError`
@@ -202,7 +194,7 @@ is retried for you.
 | `SandboxNotRunningError` | A `Sandbox` call hit a transport error and the control plane says the sandbox is not `running` (`state` tells you what it is, e.g. `paused`).                                                                                                                                 |
 | `ControlPlaneError`      | The control plane answered with an error. `status` and `code` are provisional. A 429 `concurrency_limit` means one of the organization's sandbox caps is used up — concurrent vCPUs in a region (`scope: "sandbox"`), live sandboxes + snapshots across regions (`scope: "live"`), or the assigner's CI+sandbox budget (`scope: "org"`); `concurrencyLimit(err)` parses its `details` (`limit`, `inUse`, `requested`, `region`, `scope`) and `retryAfterMs` says when to try again — the SDK does not retry it for you.                                                                                                                                                                                                |
 
-`SandboxClient` retries transport errors with bounded backoff for idempotent
+The SDK retries agent transport errors with bounded backoff for idempotent
 calls only: every `GET`, `PUT /processes/{id}`, `PUT /ports/{port}`, every
 `DELETE` except `DELETE /disks/{slot}` (a replay that finds the resource already
 gone counts as success) and `PUT /fs/file` when the body can be replayed (`Uint8Array` or `string`, not a
@@ -228,10 +220,10 @@ router holds the connection for a moment and then closes it without a byte, and
 the SDK sees a `SandboxTransportError` and tries again.
 
 `Sandbox` adds the "which side am I talking to" re-check on top: after a
-transport error it calls `cp.get(id)`; if the sandbox is not `running` you get
+transport error it asks the API for the sandbox's state; if the sandbox is not `running` you get
 `SandboxNotRunningError`, otherwise the call is retried once (and
 `streamOutput` resumes from the last delivered byte offsets; `exec` keeps its
-process id). `Sandbox.connect` on a `paused` sandbox returns without
+process id). `connect` on a `paused` sandbox returns without
 waiting for the agent; call `resume()` before using it. `create`/`connect` on a
 `deleting`, `deleted` or `failed` sandbox throws `SandboxNotRunningError` right
 away instead of waiting for an agent that will never answer.
@@ -260,12 +252,16 @@ for await (const chunk of sandbox.streamOutput("build", { follow: true, idleTime
 
 ## Control plane is provisional
 
-The `/api/v1/sandboxes` backend API is not finalized. Everything that touches
-it lives in `src/control-plane.ts` and is expected to change; the rest of the
-SDK depends only on the `SandboxControlPlane` interface, so custom or future
-adapters plug into `Sandbox` unchanged. `SandboxRecord` deliberately models
-only `id`, `state`, `hostname`, `hostnames`, `createdAt` and (on create) `token`; the full
-backend response is available as `raw`.
+The `/api/v1/sandboxes` backend API is not finalized. `SandboxRecord`
+deliberately models only `id`, `state`, `hostname`, `hostnames`, `createdAt`
+and (on create) `token`; the full backend response is available as `raw`.
+
+## Internal entry
+
+`@useblacksmith/sandbox/internal` exports the layers `Blacksmith` is built
+from (`HttpControlPlaneClient`, `SandboxControlPlane`, `SandboxClient`,
+`TokenProvider`). Blacksmith's own services use it. It is not covered by
+semver: pin an exact version if you import it.
 
 ## Agent spec
 

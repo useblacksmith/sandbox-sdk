@@ -3,7 +3,8 @@ import { mkdir, readFile as fsReadFile, writeFile as fsWriteFile } from "node:fs
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { SandboxApiError, SandboxClient, SandboxTransportError } from "../src/index.js";
+import { SandboxApiError, SandboxTransportError } from "../src/index.js";
+import { SandboxClient } from "../src/internal.js";
 import type { OutputChunk } from "../src/index.js";
 import { FakeAgent } from "./fake-agent.js";
 import { FakeRouter } from "./fake-router.js";

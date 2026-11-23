@@ -244,7 +244,7 @@ export class FakeControlPlane {
 
   private create(req: IncomingMessage, body: unknown, res: ServerResponse): void {
     const input = (body ?? {}) as Record<string, unknown>;
-    const image = typeof input.image === "string" ? input.image : input.base_image;
+    const image = input.image;
     if (typeof image !== "string" || image === "") {
       return sendError(res, 400, "invalid_argument", "The image field is required.", {
         image: ["The image field is required."],

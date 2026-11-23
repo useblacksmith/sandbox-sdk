@@ -3,12 +3,12 @@ import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ControlPlaneError,
-  HttpControlPlaneClient,
   Sandbox,
   SandboxApiError,
   SandboxNotRunningError,
   SandboxTransportError,
 } from "../src/index.js";
+import { HttpControlPlaneClient } from "../src/internal.js";
 import type { OutputChunk, PauseResumeWait, SandboxOptions } from "../src/index.js";
 import { FakeAgent } from "./fake-agent.js";
 import { FakeControlPlane } from "./fake-control-plane.js";
@@ -864,7 +864,7 @@ describe("transport-error re-check", () => {
   it("replays exec after the output stream kept dropping without running the command twice", async () => {
     const sandbox = await Sandbox.create(
       controlPlane,
-      { baseImage: "ubuntu-24.04", workload: "test" },
+      { image: "ubuntu-24.04", workload: "test" },
       options,
     );
     cp.requests.length = 0;
@@ -883,7 +883,7 @@ describe("transport-error re-check", () => {
   it("does not replay an exec that ran out of its own deadline", async () => {
     const sandbox = await Sandbox.create(
       controlPlane,
-      { baseImage: "ubuntu-24.04", workload: "test" },
+      { image: "ubuntu-24.04", workload: "test" },
       options,
     );
     cp.requests.length = 0;
@@ -1479,7 +1479,7 @@ describe("transport-error re-check", () => {
   it("does not resume a stream that hit the caller's idleTimeoutMs", async () => {
     const sandbox = await Sandbox.create(
       controlPlane,
-      { baseImage: "ubuntu-24.04", workload: "test" },
+      { image: "ubuntu-24.04", workload: "test" },
       options,
     );
     await sandbox.startProcess("quiet", { shell: "echo hi; sleep 30" });
