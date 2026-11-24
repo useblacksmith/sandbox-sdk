@@ -75,22 +75,15 @@ export interface SandboxRecord {
   raw: Record<string, unknown>;
 }
 
-/** One of `image` or the deprecated `baseImage` is required; given both, `image` is sent. */
-export type SandboxCreateOptions = SandboxCreateSettings &
-  (
-    | {
-        /**
-         * A catalog image reference (`ubuntu24`, `ubuntu24:canary`), a Blacksmith
-         * Machine's image (`machine/web-ci` for its latest ready version,
-         * `machine/web-ci:3` for version 3, `machine/web-ci:stable` for the image
-         * tagged `stable`) or a sandbox image snapshot id (`snap-…`).
-         */
-        image: string;
-        /** @deprecated Use `image`. Sent as `base_image`; accepts catalog images only. */
-        baseImage?: string;
-      }
-    | { image?: undefined; baseImage: string }
-  );
+export type SandboxCreateOptions = SandboxCreateSettings & {
+  /**
+   * A catalog image reference (`ubuntu24`, `ubuntu24:canary`), a Blacksmith
+   * Machine's image (`machine/web-ci` for its latest ready version,
+   * `machine/web-ci:3` for version 3, `machine/web-ci:stable` for the image
+   * tagged `stable`) or a sandbox image snapshot id (`snap-…`).
+   */
+  image: string;
+};
 
 export interface SandboxCreateSettings {
   /**
@@ -534,9 +527,8 @@ function checkAttribute(name: string, value: string, pattern: RegExp, letters: s
 
 function toCreateBody(options: SandboxCreateOptions): Record<string, unknown> {
   const body: Record<string, unknown> = {};
-  if (options.image !== undefined) body.image = options.image;
-  else if (options.baseImage !== undefined) body.base_image = options.baseImage;
-  else throw new TypeError("image is required");
+  if (options.image === undefined) throw new TypeError("image is required");
+  body.image = options.image;
   if (!options.workload) throw new TypeError("workload is required");
   checkAttribute("workload", options.workload, WORKLOAD_PATTERN, "lowercase letters");
   body.workload = options.workload;

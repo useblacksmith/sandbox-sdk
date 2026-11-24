@@ -1,17 +1,14 @@
-export { SandboxClient } from "./client.js";
-export type { RetryOptions, SandboxClientOptions } from "./client.js";
+export { Blacksmith } from "./blacksmith.js";
+export type { BlacksmithOptions } from "./blacksmith.js";
 export { SandboxApiError, SandboxError, SandboxTransportError, isSandboxGone } from "./errors.js";
-export { ControlPlaneError, HttpControlPlaneClient, concurrencyLimit } from "./control-plane.js";
+export { ControlPlaneError, concurrencyLimit } from "./control-plane.js";
 export type {
   ConcurrencyLimit,
-  HttpControlPlaneClientOptions,
   ImageSnapshotControlPlane,
   ImageSnapshotCreateOptions,
   ImageSnapshotListOptions,
   ImageSnapshotRecord,
   ImageSnapshotState,
-  MintedToken,
-  SandboxControlPlane,
   SandboxCreateOptions,
   SandboxCreateSettings,
   SandboxListOptions,
@@ -21,7 +18,6 @@ export type {
 } from "./control-plane.js";
 export { Sandbox, SandboxNotRunningError } from "./sandbox.js";
 export type { PauseResumeWait, SandboxOptions } from "./sandbox.js";
-export type { AgentToken, TokenProvider } from "./token.js";
 export type {
   AttachDiskResult,
   DiskAttachInput,

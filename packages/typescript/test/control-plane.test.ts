@@ -1,10 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  ControlPlaneError,
-  HttpControlPlaneClient,
-  SandboxTransportError,
-  concurrencyLimit,
-} from "../src/index.js";
+import { ControlPlaneError, SandboxTransportError, concurrencyLimit } from "../src/index.js";
+import { HttpControlPlaneClient } from "../src/internal.js";
 import { FakeControlPlane } from "./fake-control-plane.js";
 
 let cp: FakeControlPlane;
@@ -93,7 +89,7 @@ describe("HttpControlPlaneClient", () => {
         return Response.json({ ...body, token: { token: "tok-x" } }, { status: response.status });
       },
     });
-    await expect(broken.create({ baseImage: "ubuntu-24.04", workload: "test" })).rejects.toThrow(
+    await expect(broken.create({ image: "ubuntu-24.04", workload: "test" })).rejects.toThrow(
       "control plane token response is missing token, expires_at or hostname",
     );
   });
@@ -243,7 +239,7 @@ describe("HttpControlPlaneClient", () => {
         ),
     });
     const err = await c
-      .create({ baseImage: "ubuntu-24.04", workload: "test", vcpu: 4 })
+      .create({ image: "ubuntu-24.04", workload: "test", vcpu: 4 })
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(ControlPlaneError);
     expect(err).toMatchObject({
@@ -360,20 +356,10 @@ describe("HttpControlPlaneClient", () => {
     expect(err).toMatchObject({ method: "GET", attempts: 1 });
   });
 
-  it("still sends the deprecated baseImage as base_image", async () => {
-    const record = await client().create({ baseImage: "ubuntu-24.04", workload: "test" });
-    expect(cp.requests[0]).toMatchObject({ body: { base_image: "ubuntu-24.04" } });
-    expect(cp.requests[0]?.body).not.toHaveProperty("image");
-    expect(record.image).toBe("ubuntu-24.04");
-  });
-
-  it("prefers image over baseImage and requires one of them", async () => {
-    await client().create({ image: "ubuntu-24.04", workload: "test", baseImage: "ignored" });
-    expect(cp.requests[0]).toMatchObject({ body: { image: "ubuntu-24.04" } });
-    expect(cp.requests[0]?.body).not.toHaveProperty("base_image");
-    // @ts-expect-error one of image/baseImage is required at the type level too
-    await expect(client().create({ vcpu: 2 })).rejects.toThrow(TypeError);
-    expect(cp.requests).toHaveLength(1);
+  it("requires image", async () => {
+    // @ts-expect-error image is required at the type level too
+    await expect(client().create({ workload: "test" })).rejects.toThrow("image is required");
+    expect(cp.requests).toHaveLength(0);
   });
 
   it("leaves tenant out of the body when none is given", async () => {
