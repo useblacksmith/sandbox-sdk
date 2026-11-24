@@ -26,11 +26,11 @@ npm install @useblacksmith/sandbox
 ```
 
 ```ts
-import { HttpControlPlaneClient, Sandbox } from "@useblacksmith/sandbox";
+import { Blacksmith } from "@useblacksmith/sandbox";
 
-const cp = new HttpControlPlaneClient({ apiKey: process.env.BLACKSMITH_API_KEY! });
-const sandbox = await Sandbox.create(cp, {
-  image: "ubuntu-24.04",
+const bs = new Blacksmith(); // reads BLACKSMITH_API_KEY
+const sandbox = await bs.sandboxes.create({
+  image: "ubuntu24",
   workload: "ci-repro",
   tenant: "acme",
 });
