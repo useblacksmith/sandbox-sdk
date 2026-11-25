@@ -5,21 +5,20 @@
  * talks to the agent.
  */
 import * as z from "zod";
-import { SandboxError, SandboxTransportError } from "./errors.js";
+import { ControlPlaneError, SandboxError, SandboxTransportError } from "../errors.js";
+import type {
+  ImageSnapshotCreateOptions,
+  ImageSnapshotListOptions,
+  ImageSnapshotRecord,
+  SandboxCreateOptions,
+  SandboxFailure,
+  SandboxListOptions,
+  SandboxRecord,
+  Snapshots,
+} from "../resources.js";
 import type { AgentToken } from "./token.js";
 
-export type SandboxState =
-  | "queued"
-  | "starting"
-  | "running"
-  | "pausing"
-  | "paused"
-  | "resuming"
-  | "deleting"
-  | "deleted"
-  | "failed";
-
-const SandboxFailure = z
+const SandboxFailureResponse = z
   .object({
     source: z.string(),
     code: z.string(),
@@ -37,8 +36,6 @@ const SandboxFailure = z
     occurredAt: failure.occurred_at,
   }));
 
-export type SandboxFailure = z.infer<typeof SandboxFailure>;
-
 const SandboxResponse = z.object({
   id: z.string(),
   status: z.string(),
@@ -52,151 +49,19 @@ const SandboxResponse = z.object({
   last_error: z.string().optional().catch(undefined),
 });
 
-export interface SandboxRecord {
-  id: string;
-  /** Backend `status`; unknown values pass through untouched. */
-  state: SandboxState | (string & {});
-  /** Canonical hostname, the one `token.hostname` is minted for. */
-  hostname?: string;
-  /** Every hostname that reaches the sandbox, canonical first. */
-  hostnames?: string[];
-  createdAt: Date;
-  lastError?: string | SandboxFailure;
-  /** Set on `create` only: the first agent token, so no mint round-trip is needed. */
+export interface CreatedSandboxRecord extends SandboxRecord {
+  /** The first agent token, so no mint round-trip is needed. */
   token?: MintedToken;
-  /** Set on `create` only: the Idempotency-Key matched an earlier create. */
+  /** The Idempotency-Key matched an earlier create. */
   replayed?: boolean;
-  /** Absent on sandboxes created before the field existed. */
-  workload?: string;
-  tenant?: string;
-  /** What the sandbox booted from: a catalog image reference, a `machine/<name>[:<version>]` or a `snap-…` id. */
-  image?: string;
-  /** The backend response as received. */
-  raw: Record<string, unknown>;
-}
-
-export type SandboxCreateOptions = SandboxCreateSettings & {
-  /**
-   * A catalog image reference (`ubuntu24`, `ubuntu24:canary`), a Blacksmith
-   * Machine's image (`machine/web-ci` for its latest ready version,
-   * `machine/web-ci:3` for version 3, `machine/web-ci:stable` for the image
-   * tagged `stable`) or a sandbox image snapshot id (`snap-…`).
-   */
-  image: string;
-};
-
-export interface SandboxCreateSettings {
-  /**
-   * The kind of work this sandbox does, such as `agent-session`, `test-runner` or `pr-review`.
-   * Blacksmith reports usage per workload, so a clear, stable name lets you see what each kind
-   * of work costs. Keep the set small and reuse values: a name used by one sandbox tells you
-   * nothing.
-   *
-   * Lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit; at most 1024
-   * characters. `create` throws a `TypeError` for anything else.
-   *
-   * Accepted: `test-runner`, `pr_review`, `e2e.v2`, `2fa-check`.
-   * Rejected:
-   *   - `Test-Runner`: uppercase
-   *   - `test runner`: space, including a leading or trailing one
-   *   - `test/runner`, `test:runner`, `tests@v2`: any other punctuation
-   *   - `-test-runner`, `.hidden`, `_private`: starts with `-`, `.` or `_`
-   *   - `e2e-tësts`: a letter outside a-z
-   *   - an empty string
-   */
-  workload: string;
-  /**
-   * Whose work this is, when you run sandboxes on behalf of your own customers or teams, such
-   * as `acme`. Use a stable id or name, and always send it in the same form. Leave it out when
-   * every sandbox is your own.
-   *
-   * Letters, digits, `.`, `_` and `-`, starting with a letter or digit; at most 1024 characters.
-   * Case matters: `Acme` and `acme` are two tenants. `create` throws a `TypeError` for anything
-   * else.
-   *
-   * Accepted: `acme`, `Acme-Corp`, `acme.com`, `cus_Nf3x9`, `42`,
-   * `550e8400-e29b-41d4-a716-446655440000`.
-   * Rejected:
-   *   - `Acme Corp`: space
-   *   - `jane@acme.com`, `org:123`, `acme/eu`, `https://acme.com`: any other punctuation
-   *   - `-acme`: starts with `-`, `.` or `_`
-   *   - `Zoë`: a letter outside A-Z and a-z
-   *   - an empty string; leave `tenant` out instead
-   */
-  tenant?: string;
-  arch?: "amd64" | "arm64";
-  vcpu?: number;
-  env?: Record<string, string>;
-  labels?: string[];
-  idleTimeoutSeconds?: number;
-  /** Retain paused/failed sandboxes for this long after last activity. Opt-in, not creation age. */
-  idleDeleteTimeoutSeconds?: number;
-  /** Absolute lifetime from creation, independent of activity and resume. */
-  ttlSeconds?: number;
-  metadata?: Record<string, unknown>;
-  /** Ask the backend to block up to this long for the sandbox to reach `running`. */
-  waitSeconds?: number;
-  /** Sent as `Idempotency-Key`; a replayed create returns the existing record. */
-  idempotencyKey?: string;
 }
 
 export interface MintedToken extends AgentToken {
   hostname: string;
 }
 
-export interface SandboxListOptions {
-  state?: SandboxState | (string & {});
-  label?: string;
-  /** Newest first; the backend caps this. */
-  limit?: number;
-}
-
-export type ImageSnapshotState = "creating" | "ready" | "deleting" | "deleted" | "failed";
-
-/** A paused sandbox's boot disk, named so new sandboxes can be created from it. */
-export interface ImageSnapshotRecord {
-  /** `snap-…`; pass it as `image` to `create` a sandbox from it. */
-  id: string;
-  /** The sandbox whose boot disk this is. */
-  sandboxId: string;
-  /** Backend `status`; unknown values pass through untouched. */
-  state: ImageSnapshotState | (string & {});
-  /** New sandboxes must be created in this region and arch. */
-  region: string;
-  arch: string;
-  sizeBytes?: number;
-  /** After this the snapshot can no longer be used to create sandboxes. */
-  expiresAt: Date;
-  lastError?: string;
-  createdAt: Date;
-  /** The backend response as received. */
-  raw: Record<string, unknown>;
-}
-
-export interface ImageSnapshotCreateOptions {
-  /** The source sandbox; it must be `paused` and not itself created from a snapshot. */
-  sandbox: string;
-  /** How long the snapshot stays usable. The backend default and cap apply. */
-  ttlSeconds?: number;
-}
-
-export interface ImageSnapshotListOptions {
-  state?: ImageSnapshotState | (string & {});
-  /** Only snapshots of this sandbox. */
-  sandbox?: string;
-  /** Newest first; the backend caps this. */
-  limit?: number;
-}
-
-export interface ImageSnapshotControlPlane {
-  create(options: ImageSnapshotCreateOptions): Promise<ImageSnapshotRecord>;
-  get(id: string): Promise<ImageSnapshotRecord>;
-  list(options?: ImageSnapshotListOptions): Promise<ImageSnapshotRecord[]>;
-  delete(id: string): Promise<ImageSnapshotRecord>;
-}
-
 export interface SandboxControlPlane {
-  create(options: SandboxCreateOptions): Promise<SandboxRecord>;
+  create(options: SandboxCreateOptions): Promise<CreatedSandboxRecord>;
   get(id: string): Promise<SandboxRecord>;
   list(options?: SandboxListOptions): Promise<SandboxRecord[]>;
   pause(id: string): Promise<SandboxRecord>;
@@ -204,34 +69,7 @@ export interface SandboxControlPlane {
   delete(id: string): Promise<SandboxRecord>;
   mintToken(id: string): Promise<MintedToken>;
   /** `/api/v1/images/…`: things a sandbox can boot from. */
-  readonly images: { readonly snapshots: ImageSnapshotControlPlane };
-}
-
-/** The control plane answered with `{"error": {"code", "message", "details", "status"}}`. */
-export class ControlPlaneError extends SandboxError {
-  readonly status: number;
-  readonly code: string;
-  readonly details: Record<string, unknown> | undefined;
-  /** The sandbox's current status, sent with `invalid_state`, e.g. `running` or `deleted`. */
-  readonly sandboxStatus: string | undefined;
-  /** From a 429's `Retry-After: <seconds>`. */
-  readonly retryAfterMs: number | undefined;
-
-  constructor(
-    status: number,
-    code: string,
-    message: string,
-    details?: Record<string, unknown>,
-    sandboxStatus?: string,
-    retryAfterMs?: number,
-  ) {
-    super(message);
-    this.status = status;
-    this.code = code;
-    this.details = details;
-    this.sandboxStatus = sandboxStatus;
-    this.retryAfterMs = retryAfterMs;
-  }
+  readonly images: { readonly snapshots: Snapshots };
 }
 
 const TerminalFailureDetails = z.object({
@@ -272,57 +110,9 @@ export interface HttpControlPlaneClientOptions {
 const DEFAULT_BASE_URL = "https://api.blacksmith.sh";
 const DEFAULT_TIMEOUT_MS = 30_000;
 
-/**
- * `details` of a 429 `concurrency_limit`: one of the installation's sandbox caps is used up.
- * `scope: "sandbox"` is the control plane's concurrent-vCPU cap in `region` (paused sandboxes
- * do not count); `scope: "live"` is its cap on live sandboxes (paused included) plus snapshots
- * across all regions, so `requested` is 1 and `region` is where the refused object would have
- * lived; both carry `limit`/`inUse`. `scope: "org"` is the assigner's org budget (shared with
- * CI), which the control plane cannot count, so both are null. Pause or delete a sandbox,
- * delete a snapshot, or wait `retryAfterMs`; a retry loop will not help.
- */
-export type ConcurrencyLimit =
-  | {
-      readonly scope: "sandbox" | "live";
-      readonly limit: number;
-      readonly inUse: number;
-      readonly requested: number;
-      readonly region: string;
-    }
-  | {
-      readonly scope: "org";
-      readonly limit: null;
-      readonly inUse: null;
-      readonly requested: number;
-      readonly region: string;
-    };
-
-/** `undefined` for any other error, and for a `concurrency_limit` whose details drifted from the contract above. */
-export function concurrencyLimit(error: unknown): ConcurrencyLimit | undefined {
-  if (!(error instanceof ControlPlaneError) || error.code !== "concurrency_limit") {
-    return undefined;
-  }
-  const d = error.details;
-  if (d === undefined || typeof d.requested !== "number" || typeof d.region !== "string") {
-    return undefined;
-  }
-  const { requested, region } = d;
-  if (
-    (d.scope === "sandbox" || d.scope === "live") &&
-    typeof d.limit === "number" &&
-    typeof d.in_use === "number"
-  ) {
-    return { scope: d.scope, limit: d.limit, inUse: d.in_use, requested, region };
-  }
-  if (d.scope === "org" && d.limit === null && d.in_use === null) {
-    return { scope: "org", limit: null, inUse: null, requested, region };
-  }
-  return undefined;
-}
-
 export class HttpControlPlaneClient implements SandboxControlPlane {
   readonly baseUrl: string;
-  readonly images: { readonly snapshots: ImageSnapshotControlPlane };
+  readonly images: { readonly snapshots: Snapshots };
   private readonly apiKey: string;
   private readonly fetchImpl: typeof globalThis.fetch;
   private readonly timeoutMs: number;
@@ -336,7 +126,7 @@ export class HttpControlPlaneClient implements SandboxControlPlane {
     this.images = { snapshots: new HttpImageSnapshots((m, p, j) => this.request(m, p, j)) };
   }
 
-  async create(options: SandboxCreateOptions): Promise<SandboxRecord> {
+  async create(options: SandboxCreateOptions): Promise<CreatedSandboxRecord> {
     const headers: Record<string, string> = {};
     if (options.idempotencyKey !== undefined) headers["Idempotency-Key"] = options.idempotencyKey;
     const { body, response } = await this.send(
@@ -345,7 +135,7 @@ export class HttpControlPlaneClient implements SandboxControlPlane {
       toCreateBody(options),
       headers,
     );
-    const record = toRecord(body);
+    const record: CreatedSandboxRecord = toRecord(body);
     if (body.token !== undefined) record.token = toMintedToken(asObject(body.token));
     record.replayed = response.headers.get("Idempotent-Replayed") === "true";
     return record;
@@ -443,7 +233,7 @@ type RequestFn = (
   json?: Record<string, unknown>,
 ) => Promise<Record<string, unknown>>;
 
-class HttpImageSnapshots implements ImageSnapshotControlPlane {
+class HttpImageSnapshots implements Snapshots {
   constructor(private readonly request: RequestFn) {}
 
   async create(options: ImageSnapshotCreateOptions): Promise<ImageSnapshotRecord> {
@@ -579,7 +369,7 @@ function parseSandboxFailure(raw: string): string | SandboxFailure {
   } catch {
     return raw;
   }
-  const parsed = SandboxFailure.safeParse(decoded);
+  const parsed = SandboxFailureResponse.safeParse(decoded);
   return parsed.success ? parsed.data : raw;
 }
 

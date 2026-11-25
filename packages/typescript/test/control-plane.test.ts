@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { ControlPlaneError, SandboxTransportError, concurrencyLimit } from "../src/index.js";
-import { HttpControlPlaneClient } from "../src/internal.js";
+import { HttpControlPlaneClient } from "../src/internal/index.js";
 import { FakeControlPlane } from "./fake-control-plane.js";
 
 let cp: FakeControlPlane;
@@ -76,7 +76,7 @@ describe("HttpControlPlaneClient", () => {
     expect(replay.token).toBeUndefined();
     expect(replay.replayed).toBe(true);
     expect(cp.records.size).toBe(1);
-    expect((await client().get(record.id)).token).toBeUndefined();
+    expect(await client().get(record.id)).not.toHaveProperty("token");
   });
 
   it("rejects a create response whose token is malformed", async () => {

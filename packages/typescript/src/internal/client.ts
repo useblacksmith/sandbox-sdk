@@ -8,31 +8,30 @@ import type {
   PortExposureList,
   Process,
   ProcessList,
-} from "./generated/types.gen.js";
-import { SandboxApiError, SandboxTransportError, isSandboxGone } from "./errors.js";
+} from "../generated/types.gen.js";
+import { SandboxApiError, SandboxTransportError } from "../errors.js";
+import { isSandboxGone } from "./errors.js";
 import { parseNdjson } from "./ndjson.js";
 import { TokenSource, type TokenProvider } from "./token.js";
-import {
-  toDiskAttachRequest,
-  toOutputChunk,
-  toProcessSpec,
-  type AttachDiskResult,
-  type DiskAttachInput,
-  type ExposePortResult,
-  type FileContent,
-  type FileMetadata,
-  type FileStream,
-  type OutputChunk,
-  type OutputExitChunk,
-  type ExecOptions,
-  type ProcessSpecInput,
-  type RequestOptions,
-  type StartProcessResult,
-  type StreamOutputOptions,
-  type StreamRequestOptions,
-  type WriteFileBody,
-  type WriteFileOptions,
-} from "./types.js";
+import { toDiskAttachRequest, toOutputChunk, toProcessSpec } from "./wire.js";
+import type {
+  AttachDiskResult,
+  DiskAttachInput,
+  ExposePortResult,
+  FileContent,
+  FileMetadata,
+  FileStream,
+  OutputChunk,
+  OutputExitChunk,
+  ExecOptions,
+  ProcessSpecInput,
+  RequestOptions,
+  StartProcessResult,
+  StreamOutputOptions,
+  StreamRequestOptions,
+  WriteFileBody,
+  WriteFileOptions,
+} from "../types.js";
 
 export interface RetryOptions {
   /** Total attempts for idempotent requests that fail at the transport level. */
@@ -87,8 +86,8 @@ const PROCESS_MAX_TIMEOUT_SECONDS = 31_622_400;
 const EXEC_CLEANUP_TIMEOUT_MS = 5_000;
 /** The host may format and mount the disk before answering; the CLI allows the same. */
 const ATTACH_DISK_TIMEOUT_MS = 180_000;
-/** Detach unmounts in the guest first. */
-const DETACH_DISK_TIMEOUT_MS = 60_000;
+/** An output stream cut after being open this long was working: the cut is not a failed attempt. */
+const QUIET_STREAM_MS = 60_000;
 const DEFAULT_RETRY: Required<RetryOptions> = {
   maxAttempts: 3,
   baseDelayMs: 200,
@@ -280,13 +279,15 @@ export class SandboxClient {
     const from = { stdout: 0, stderr: 0 };
     let truncated = false;
     for (let attempt = 1; ; attempt++) {
+      let openedAt: number | undefined;
       try {
-        for await (const chunk of this.streamOutput(id, {
-          ...request,
-          follow: true,
-          stdoutFrom: from.stdout,
-          stderrFrom: from.stderr,
-        })) {
+        for await (const chunk of this.followOutput(
+          id,
+          { ...request, follow: true, stdoutFrom: from.stdout, stderrFrom: from.stderr },
+          () => {
+            openedAt = Date.now();
+          },
+        )) {
           if (chunk.type === "exit") {
             return {
               stdout: concat(parts.stdout),
@@ -310,10 +311,14 @@ export class SandboxClient {
           new Error("output stream ended before the exit event"),
         );
       } catch (error) {
-        if (!(error instanceof SandboxTransportError) || attempt >= this.retry.maxAttempts) {
-          throw error;
-        }
-        await sleep(backoffDelay(attempt, this.retry), request.signal);
+        if (!(error instanceof SandboxTransportError)) throw error;
+        // Runtimes cut a response that stays silent (Node after 300s), and a command can be
+        // silent for longer. A stream that stayed open was working, so its cut is resumed
+        // without using up an attempt; the exec deadline bounds the call.
+        const held = openedAt !== undefined && Date.now() - openedAt >= QUIET_STREAM_MS;
+        if (held) attempt = 0;
+        else if (attempt >= this.retry.maxAttempts) throw error;
+        await sleep(backoffDelay(Math.max(attempt, 1), this.retry), request.signal);
       }
     }
   }
@@ -323,7 +328,16 @@ export class SandboxClient {
    * stays open until the `exit` chunk. A transport failure mid-stream throws
    * `SandboxTransportError`; resume from the last seen offsets.
    */
-  async *streamOutput(id: string, options: StreamOutputOptions = {}): AsyncGenerator<OutputChunk> {
+  streamOutput(id: string, options: StreamOutputOptions = {}): AsyncGenerator<OutputChunk> {
+    return this.followOutput(id, options, noop);
+  }
+
+  /** `onOpen` runs once the agent has answered and before the first chunk is read. */
+  private async *followOutput(
+    id: string,
+    options: StreamOutputOptions,
+    onOpen: () => void,
+  ): AsyncGenerator<OutputChunk> {
     const { stream, stdoutFrom, stderrFrom, follow, idleTimeoutMs, ...request } = options;
     const { response, release, idle } = await this.send({
       method: "GET",
@@ -333,6 +347,7 @@ export class SandboxClient {
       stream: { idleTimeoutMs },
       options: request,
     });
+    onOpen();
     try {
       if (!response.body) return;
       for await (const event of parseNdjson(watched(response.body, idle))) {
@@ -476,21 +491,6 @@ export class SandboxClient {
       options,
     });
     return list.disks;
-  }
-
-  /**
-   * Unmounts the disk at `slot` and fails its drive. The slot stays taken until
-   * the VM stops. Idempotent, but not retried: a replay during the unmount gets
-   * 409, and one after a first attempt that never arrived gets 404 for an empty
-   * slot instead of a disk. Defaults to a 60s timeout.
-   */
-  async detachDisk(slot: number, options?: RequestOptions): Promise<Disk> {
-    return this.json<Disk>({
-      method: "DELETE",
-      path: `/disks/${slotSegment(slot)}`,
-      idempotent: false,
-      options: { ...options, timeoutMs: options?.timeoutMs ?? DETACH_DISK_TIMEOUT_MS },
-    });
   }
 
   /**
@@ -671,13 +671,6 @@ function portSegment(port: number): string {
   return String(port);
 }
 
-function slotSegment(slot: number): string {
-  if (!Number.isInteger(slot) || slot < 2 || slot > 11) {
-    throw new RangeError(`slot must be an integer in 2..11, got ${slot}`);
-  }
-  return String(slot);
-}
-
 function formatMode(mode: string | number | undefined): string | undefined {
   if (mode === undefined) return undefined;
   return typeof mode === "number" ? `0${mode.toString(8).padStart(3, "0")}` : mode;
@@ -702,6 +695,10 @@ function attachedDurationMs(process: Process, called: number): number {
 function execTimeoutSeconds(requested: number | undefined): number {
   if (requested === undefined) return EXEC_DEFAULT_TIMEOUT_SECONDS;
   return requested > PROCESS_MAX_TIMEOUT_SECONDS ? 0 : requested;
+}
+
+export function newProcessId(): string {
+  return `proc-${crypto.randomUUID()}`;
 }
 
 export function newExecProcessId(): string {
