@@ -1,4 +1,5 @@
-import { ControlPlaneError, type MintedToken, type SandboxControlPlane } from "./control-plane.js";
+import { ControlPlaneError } from "../errors.js";
+import type { MintedToken, SandboxControlPlane } from "./control-plane.js";
 import { DEFAULT_REFRESH_FRACTION } from "./token.js";
 
 const MAX_SANDBOXES = 1_000;

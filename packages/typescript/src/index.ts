@@ -1,10 +1,14 @@
 export { Blacksmith } from "./blacksmith.js";
 export type { BlacksmithOptions } from "./blacksmith.js";
-export { SandboxApiError, SandboxError, SandboxTransportError, isSandboxGone } from "./errors.js";
-export { ControlPlaneError, concurrencyLimit } from "./control-plane.js";
+export {
+  ControlPlaneError,
+  SandboxApiError,
+  SandboxError,
+  SandboxTransportError,
+  concurrencyLimit,
+} from "./errors.js";
+export type { ConcurrencyLimit } from "./errors.js";
 export type {
-  ConcurrencyLimit,
-  ImageSnapshotControlPlane,
   ImageSnapshotCreateOptions,
   ImageSnapshotListOptions,
   ImageSnapshotRecord,
@@ -15,13 +19,11 @@ export type {
   SandboxFailure,
   SandboxRecord,
   SandboxState,
-} from "./control-plane.js";
-export { Sandbox, SandboxNotRunningError } from "./sandbox.js";
-export type { PauseResumeWait, SandboxOptions } from "./sandbox.js";
+  Snapshots,
+} from "./resources.js";
+export { SandboxNotRunningError } from "./sandbox.js";
+export type { PauseResumeWait, Sandbox, SandboxOptions } from "./sandbox.js";
 export type {
-  AttachDiskResult,
-  DiskAttachInput,
-  ExposePortResult,
   FileContent,
   FileMetadata,
   FileStream,
@@ -30,9 +32,7 @@ export type {
   OutputExitChunk,
   OutputGapChunk,
   ProcessSpecInput,
-  ExecOptions,
   RequestOptions,
-  StartProcessResult,
   StreamOutputOptions,
   StreamRequestOptions,
   WriteFileBody,

@@ -1,8 +1,7 @@
 # @useblacksmith/sandbox
 
 TypeScript SDK for Blacksmith sandboxes: create a VM, run commands, move files,
-stream process output, expose ports on public hostnames, attach sticky disks,
-pause/resume/delete.
+stream process output, expose ports on public hostnames, pause/resume/delete.
 Node >= 20, ESM, no runtime dependencies.
 
 ## Install
@@ -31,8 +30,8 @@ await sandbox.writeFile(
   },
 );
 
-await sandbox.startProcess("build", { cmd: ["/work/build.sh"], cwd: "/work" });
-for await (const chunk of sandbox.streamOutput("build", { follow: true })) {
+const build = await sandbox.startProcess({ cmd: ["/work/build.sh"], cwd: "/work" });
+for await (const chunk of sandbox.streamOutput(build.id, { follow: true })) {
   if (chunk.type === "stdout") process.stdout.write(chunk.data);
   if (chunk.type === "exit") console.log("exit", chunk.exitCode);
 }
@@ -77,53 +76,22 @@ responses to the port inside the VM. The process must listen on `0.0.0.0` (or
 capability.
 
 ```ts
-await sandbox.startProcess("web", { shell: "python3 -m http.server 8080 --bind 0.0.0.0" });
-const { exposure, created } = await sandbox.exposePort(8080);
-console.log(created ? "exposed" : "already exposed", exposure.url);
+await sandbox.startProcess({ shell: "python3 -m http.server 8080 --bind 0.0.0.0" });
+const exposure = await sandbox.exposePort(8080);
+console.log(exposure.url);
 
 for (const p of await sandbox.listPorts()) console.log(p.port, p.hostname);
 await sandbox.unexposePort(8080);
 ```
 
-`exposePort` is idempotent: the first call answers 201 (`created: true`), later
-calls 200 with the same `hostname`, `rand` and `created_at`. Nothing checks that
+`exposePort` is idempotent: a later call for the same port returns the same
+`hostname`, `rand` and `created_at`. Nothing checks that
 the port is listening; the hostname answers 502 until it is. The agent refuses
 its own shim port (`invalid_argument`) and more than 32 exposures (`conflict`);
 `unexposePort` on a port that is not exposed is `not_found`. Exposures are
 recorded on the sandbox's boot disk, so they survive pause/resume (the hostname
 is stable and its DNS record follows the sandbox) and disappear with the
 sandbox.
-
-## Sticky disks
-
-`attachDisk` serves an existing sticky disk entity on a free drive slot of the
-running VM. The caller brings the credential: an entity-scoped storage-agent JWT
-the control plane mints for this sandbox (same installation, region and storage
-agent as the sandbox's boot disk; 1 h TTL). With `mountPath` the host mounts the
-disk there in the guest, formatting a disk with no filesystem as ext4 first;
-without it the guest only sees a block device at `device`.
-
-```ts
-const { disk, created } = await sandbox.attachDisk({
-  entityId: credential.entity_id,
-  entityJwt: credential.entity_jwt,
-  mountPath: "/home/blacksmith/.gradle",
-});
-for (const d of await sandbox.listDisks()) console.log(d.slot, d.device, d.mount_path);
-await sandbox.detachDisk(disk.slot);
-```
-
-Writes to an attached disk are discarded: nothing is ever committed back to the
-entity. `attachDisk` is idempotent per entity (201 `created: true`, then 200 with
-the same attachment); re-attaching with a different `mountPath` is `conflict`, as
-is a full set of slots. The host answers `forbidden` when the storage agent
-rejects the JWT and `not_found` when it does not know the entity. `detachDisk`
-unmounts the disk and fails its drive; the slot stays taken until the VM stops.
-`attachDisk` defaults to a 180s timeout and `detachDisk` to 60s. Neither is
-retried: a replay while the first attempt is still running gets `conflict`.
-
-**Attachments last for the current VM only.** `pause()`/`resume()`, an idle
-pause or a crash drops them, so re-attach after every resume.
 
 ## Image snapshots
 
@@ -196,23 +164,23 @@ is retried for you.
 
 The SDK retries agent transport errors with bounded backoff for idempotent
 calls only: every `GET`, `PUT /processes/{id}`, `PUT /ports/{port}`, every
-`DELETE` except `DELETE /disks/{slot}` (a replay that finds the resource already
-gone counts as success) and `PUT /fs/file` when the body can be replayed (`Uint8Array` or `string`, not a
+`DELETE` (a replay that finds the resource already gone counts as success) and `PUT /fs/file` when the body can be replayed (`Uint8Array` or `string`, not a
 `ReadableStream`).
 
-`exec` is built on those: the SDK picks a process id (`exec-<uuid>`, or
-`options.processId`) and runs `PUT /processes/{id}` → `GET
+`exec` is built on those: the SDK picks a process id (`exec-<uuid>`) and runs `PUT /processes/{id}` → `GET
 /processes/{id}/output?follow=true` → `DELETE /processes/{id}`. The agent keys
 processes by id, so a start whose reply was lost is replayed under the same id
 and the command still runs once; the output stream resumes from the last byte
 offsets after a cut. The agent's `POST /exec` is not used, because it carries no
 client id and cannot be retried safely. The `DELETE` runs once the call has its
-answer, or when the call's deadline or your `signal` cuts the command short. If
-you passed a `processId` and the call fails with a transport error, the process is
-left in place so a replay under the same id finds it instead of starting the
-command again; a generated id is never replayed, so that process is deleted even
-when the start's own response was lost. The `DELETE` is bounded to 5s in total,
-retries included.
+answer, or when the call's deadline or your `signal` cuts the command short; it
+is bounded to 5s in total, retries included.
+
+`startProcess` works the same way: the SDK picks the id (`proc-<uuid>`) before
+the first attempt and returns it as `Process.id`, so its own retries start the
+command once. You do not choose process ids. A second `startProcess` call always
+starts a second process; keep the returned id, or find the process again with
+`listProcesses()`.
 
 This also covers a client that resolved a stale DNS answer right after create or
 resume: it reaches a host whose sandbox-router does not own the sandbox, the
@@ -242,7 +210,10 @@ bytes. The timer only runs while the SDK is waiting on the network, so a slow
 consumer is never counted as idle, and `Sandbox.streamOutput` does not resume a
 stream that hit it. Stream requests are sent with `timeout: false` in the fetch
 init so Bun's own 5-minute socket idle timeout cannot cut a quiet
-`follow: true` stream; Node ignores the option.
+`follow: true` stream; Node ignores the option and cuts a response that sends
+no bytes for 300s. `exec` resumes its output stream from the last offsets each
+time that happens, however often, until its own deadline; a `streamOutput`
+caller on Node resumes the same way or passes a `fetch` without that timeout.
 
 ```ts
 for await (const chunk of sandbox.streamOutput("build", { follow: true, idleTimeoutMs: 600_000 })) {
@@ -253,15 +224,23 @@ for await (const chunk of sandbox.streamOutput("build", { follow: true, idleTime
 ## Control plane is provisional
 
 The `/api/v1/sandboxes` backend API is not finalized. `SandboxRecord`
-deliberately models only `id`, `state`, `hostname`, `hostnames`, `createdAt`
-and (on create) `token`; the full backend response is available as `raw`.
+deliberately models only `id`, `state`, `hostname`, `hostnames`, `createdAt`;
+the full backend response is available as `raw`.
 
 ## Internal entry
 
 `@useblacksmith/sandbox/internal` exports the layers `Blacksmith` is built
 from (`HttpControlPlaneClient`, `SandboxControlPlane`, `SandboxClient`,
-`TokenProvider`). Blacksmith's own services use it. It is not covered by
+`TokenProvider`) and the `Sandbox` class itself, whose `Sandbox.create(cp, …)`
+and `Sandbox.connect(cp, …)` take a control plane. The main entry exports
+`Sandbox` as a type only: get one from `bs.sandboxes.create` or
+`bs.sandboxes.connect`. Blacksmith's own services use it. It is not covered by
 semver: pin an exact version if you import it.
+
+In the source, `src/internal/` holds everything only that entry exports. The
+main entry (`src/index.ts`) exports nothing from `src/internal/`: `Sandbox`
+there is an interface in `src/sandbox.ts`, which the class in
+`src/internal/sandbox.ts` implements. `test/entry.test.ts` checks this.
 
 ## Agent spec
 

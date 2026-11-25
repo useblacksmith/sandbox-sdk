@@ -58,22 +58,6 @@ export class SandboxTransportError extends SandboxError {
   }
 }
 
-/**
- * The host's answer for a sandbox it no longer runs: `sandbox_failed`,
- * `sandbox_paused` or `sandbox_deleted` from the socket the agent keeps
- * serving for a few minutes after the VM went. `details.vm_id` names the VM
- * it speaks for, which is not necessarily the one the control plane routes
- * to now, so the control plane's record is the one to trust.
- */
-export function isSandboxGone(error: unknown): error is SandboxApiError {
-  return (
-    error instanceof SandboxApiError &&
-    (error.code === "sandbox_failed" ||
-      error.code === "sandbox_paused" ||
-      error.code === "sandbox_deleted")
-  );
-}
-
 function parseEnvelope(raw: string): ErrorBody | undefined {
   let parsed: unknown;
   try {
@@ -129,4 +113,79 @@ function describeCause(cause: unknown): string {
     return cause.message;
   }
   return String(cause);
+}
+
+/** The control plane answered with `{"error": {"code", "message", "details", "status"}}`. */
+export class ControlPlaneError extends SandboxError {
+  readonly status: number;
+  readonly code: string;
+  readonly details: Record<string, unknown> | undefined;
+  /** The sandbox's current status, sent with `invalid_state`, e.g. `running` or `deleted`. */
+  readonly sandboxStatus: string | undefined;
+  /** From a 429's `Retry-After: <seconds>`. */
+  readonly retryAfterMs: number | undefined;
+
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    details?: Record<string, unknown>,
+    sandboxStatus?: string,
+    retryAfterMs?: number,
+  ) {
+    super(message);
+    this.status = status;
+    this.code = code;
+    this.details = details;
+    this.sandboxStatus = sandboxStatus;
+    this.retryAfterMs = retryAfterMs;
+  }
+}
+
+/**
+ * `details` of a 429 `concurrency_limit`: one of the installation's sandbox caps is used up.
+ * `scope: "sandbox"` is the control plane's concurrent-vCPU cap in `region` (paused sandboxes
+ * do not count); `scope: "live"` is its cap on live sandboxes (paused included) plus snapshots
+ * across all regions, so `requested` is 1 and `region` is where the refused object would have
+ * lived; both carry `limit`/`inUse`. `scope: "org"` is the assigner's org budget (shared with
+ * CI), which the control plane cannot count, so both are null. Pause or delete a sandbox,
+ * delete a snapshot, or wait `retryAfterMs`; a retry loop will not help.
+ */
+export type ConcurrencyLimit =
+  | {
+      readonly scope: "sandbox" | "live";
+      readonly limit: number;
+      readonly inUse: number;
+      readonly requested: number;
+      readonly region: string;
+    }
+  | {
+      readonly scope: "org";
+      readonly limit: null;
+      readonly inUse: null;
+      readonly requested: number;
+      readonly region: string;
+    };
+
+/** `undefined` for any other error, and for a `concurrency_limit` whose details drifted from the contract above. */
+export function concurrencyLimit(error: unknown): ConcurrencyLimit | undefined {
+  if (!(error instanceof ControlPlaneError) || error.code !== "concurrency_limit") {
+    return undefined;
+  }
+  const d = error.details;
+  if (d === undefined || typeof d.requested !== "number" || typeof d.region !== "string") {
+    return undefined;
+  }
+  const { requested, region } = d;
+  if (
+    (d.scope === "sandbox" || d.scope === "live") &&
+    typeof d.limit === "number" &&
+    typeof d.in_use === "number"
+  ) {
+    return { scope: d.scope, limit: d.limit, inUse: d.in_use, requested, region };
+  }
+  if (d.scope === "org" && d.limit === null && d.in_use === null) {
+    return { scope: "org", limit: null, inUse: null, requested, region };
+  }
+  return undefined;
 }

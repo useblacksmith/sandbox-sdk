@@ -230,13 +230,6 @@ export class FakeAgent {
         return sendJson(res, 200, { disks });
       }
       if (method === "POST" && path === "/disks") return await this.attachDisk(req, res);
-      const diskMatch = /^\/disks\/([^/]+)$/.exec(path);
-      if (diskMatch && method === "DELETE") {
-        const disk = this.disks.get(Number(diskMatch[1]));
-        if (!disk) return sendError(res, 404, "not_found", `nothing attached at ${diskMatch[1]}`);
-        disk.detached_at ??= new Date().toISOString();
-        return sendJson(res, 200, disk);
-      }
       if (path === "/fs/file" && method === "GET")
         return await this.readFile(url.searchParams, res);
       if (path === "/fs/file" && method === "PUT")

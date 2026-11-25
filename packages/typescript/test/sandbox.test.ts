@@ -3,13 +3,13 @@ import { join } from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ControlPlaneError,
-  Sandbox,
   SandboxApiError,
   SandboxNotRunningError,
   SandboxTransportError,
 } from "../src/index.js";
-import { HttpControlPlaneClient } from "../src/internal.js";
-import type { OutputChunk, PauseResumeWait, SandboxOptions } from "../src/index.js";
+import { HttpControlPlaneClient, Sandbox } from "../src/internal/index.js";
+import type { SandboxAttachOptions } from "../src/internal/index.js";
+import type { OutputChunk, PauseResumeWait } from "../src/index.js";
 import { FakeAgent } from "./fake-agent.js";
 import { FakeControlPlane } from "./fake-control-plane.js";
 import { requestUrl } from "./request-url.js";
@@ -37,10 +37,10 @@ beforeEach(() => {
   agent.expiredTokens.clear();
 });
 
-const options: SandboxOptions = {
+const options: SandboxAttachOptions = {
   agentBaseUrl: () => agent.url,
   readyTimeoutMs: 5_000,
-  client: { retry: { baseDelayMs: 1, maxDelayMs: 5 } },
+  retry: { baseDelayMs: 1, maxDelayMs: 5 },
 };
 
 const agentPaths = () => agent.requests.map((r) => r.path);
@@ -408,12 +408,10 @@ describe("Sandbox.create / connect", () => {
     const error = await Sandbox.connect(failing, record.id, {
       ...options,
       readyTimeoutMs: 60_000,
-      client: {
-        retry: { maxAttempts: 1 },
-        fetch: async () => {
-          record.status = "failed";
-          throw dnsError;
-        },
+      retry: { maxAttempts: 1 },
+      fetch: async () => {
+        record.status = "failed";
+        throw dnsError;
       },
     }).catch((error: unknown) => error);
     expect(error).toBeInstanceOf(SandboxNotRunningError);
@@ -721,8 +719,7 @@ describe("ports", () => {
     cp.requests.length = 0;
     agent.faults.push("reset", "reset", "reset");
 
-    const { created, exposure } = await sandbox.exposePort(8080);
-    expect(created).toBe(true);
+    const exposure = await sandbox.exposePort(8080);
     expect(exposure.hostname).toBe(
       `port-8080-${exposure.rand}-${agent.sandboxId}.${agent.sandboxDomain}`,
     );
@@ -736,7 +733,7 @@ describe("ports", () => {
 });
 
 describe("disks", () => {
-  it("attaches, lists and detaches sticky disks, re-checking but not replaying an attach", async () => {
+  it("attaches and lists sticky disks, re-checking but not replaying an attach", async () => {
     const sandbox = await Sandbox.create(
       controlPlane,
       { image: "ubuntu-24.04", workload: "test" },
@@ -757,13 +754,10 @@ describe("disks", () => {
     expect(agentPaths().filter((p) => p === "/v1/disks")).toHaveLength(1);
     expect(cpCalls()).toEqual([`GET /api/v1/sandboxes/${sandbox.id}`]);
 
-    const { created, disk } = await sandbox.attachDisk(input);
-    expect(created).toBe(true);
+    const disk = await sandbox.attachDisk(input);
     expect(disk).toMatchObject({ entity_id: 9, mount_path: "/home/blacksmith/.gradle" });
 
     expect(await sandbox.listDisks()).toEqual([disk]);
-    const detached = await sandbox.detachDisk(disk.slot);
-    expect(await sandbox.listDisks()).toEqual([detached]);
   });
 });
 
@@ -861,6 +855,49 @@ describe("transport-error re-check", () => {
     expect(cpCalls()).toEqual([`GET /api/v1/sandboxes/${sandbox.id}`]);
   });
 
+  it("starts a process once under a generated id however often the start is retried", async () => {
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
+    agent.faults.push("reset", "reset", "reset");
+
+    const process = await sandbox.startProcess({ shell: "sleep 30" });
+    expect(process.id).toMatch(/^proc-[0-9a-f-]{36}$/);
+    const starts = agent.requests.filter((r) => r.method === "PUT").map((r) => r.path);
+    expect(starts).toHaveLength(4);
+    expect(new Set(starts)).toEqual(new Set([`/v1/processes/${process.id}`]));
+    expect((await sandbox.listProcesses()).map((p) => p.id)).toEqual([process.id]);
+    await sandbox.killProcess(process.id);
+  });
+
+  it("starts a second process for a second startProcess call with the same spec", async () => {
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
+    const first = await sandbox.startProcess({ shell: "sleep 30" });
+    const second = await sandbox.startProcess({ shell: "sleep 30" });
+    expect(second.id).not.toBe(first.id);
+    expect(await sandbox.listProcesses()).toHaveLength(2);
+    await Promise.all([first, second].map((p) => sandbox.killProcess(p.id)));
+  });
+
+  it("returns the existing process when startProcess is replayed under a fixed id", async () => {
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
+    const first = await sandbox.startProcess({ shell: "sleep 30" }, { processId: "build" });
+    const second = await sandbox.startProcess({ shell: "sleep 30" }, { processId: "build" });
+    expect(second).toEqual(first);
+    expect(await sandbox.listProcesses()).toHaveLength(1);
+    await sandbox.killProcess("build");
+  });
+
   it("replays exec after the output stream kept dropping without running the command twice", async () => {
     const sandbox = await Sandbox.create(
       controlPlane,
@@ -894,7 +931,7 @@ describe("transport-error re-check", () => {
     expect(err).toBeInstanceOf(SandboxTransportError);
     expect(err).toMatchObject({ method: "EXEC" });
     expect(agent.requests.filter(isExecStart)).toHaveLength(1);
-    expect(await sandbox.client.listProcesses()).toEqual([]);
+    expect(await sandbox.listProcesses()).toEqual([]);
   });
 
   it("surfaces SandboxNotRunningError when a resume outlives the cycle timeout", async () => {
@@ -1390,7 +1427,7 @@ describe("transport-error re-check", () => {
       { image: "ubuntu-24.04", workload: "test" },
       options,
     );
-    const { process } = await sandbox.startProcess("tomb", {
+    const process = await sandbox.startProcess({
       shell: "for i in 1 2 3; do echo tick $i; sleep 0.1; done",
     });
     cp.requests.length = 0;
@@ -1457,7 +1494,7 @@ describe("transport-error re-check", () => {
       { image: "ubuntu-24.04", workload: "test" },
       options,
     );
-    await sandbox.startProcess("p", { shell: "printf abc; sleep 0.3; printf def" });
+    await sandbox.startProcess({ shell: "printf abc; sleep 0.3; printf def" }, { processId: "p" });
     await new Promise((resolve) => setTimeout(resolve, 100));
     agent.faults.push("cut-stream");
 
@@ -1482,7 +1519,7 @@ describe("transport-error re-check", () => {
       { image: "ubuntu-24.04", workload: "test" },
       options,
     );
-    await sandbox.startProcess("quiet", { shell: "echo hi; sleep 30" });
+    await sandbox.startProcess({ shell: "echo hi; sleep 30" }, { processId: "quiet" });
     agent.faults.push("stall");
 
     const error = await (async () => {
@@ -1491,5 +1528,21 @@ describe("transport-error re-check", () => {
 
     expect(error).toBeInstanceOf(SandboxTransportError);
     expect(agentPaths().filter((p) => p.startsWith("/v1/processes/quiet/output"))).toHaveLength(1);
+  });
+});
+
+describe("Sandbox.health", () => {
+  it("probes the agent once and leaves the control plane alone when the probe fails", async () => {
+    const sandbox = await Sandbox.create(
+      controlPlane,
+      { image: "ubuntu-24.04", workload: "test" },
+      options,
+    );
+    cp.requests.length = 0;
+    agent.faults.push("sandbox_paused", "sandbox_paused");
+
+    await expect(sandbox.health()).rejects.toMatchObject({ code: "sandbox_paused" });
+    expect(cp.requests).toHaveLength(0);
+    expect(await sandbox.health()).toMatchObject({ status: "ok" });
   });
 });

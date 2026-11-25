@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { SandboxApiError, SandboxTransportError } from "../src/index.js";
-import { SandboxClient } from "../src/internal.js";
+import { SandboxClient } from "../src/internal/index.js";
 import type { OutputChunk } from "../src/index.js";
 import { FakeAgent } from "./fake-agent.js";
 import { FakeRouter } from "./fake-router.js";
@@ -460,6 +460,53 @@ describe("exec", () => {
     await expect(overridden).rejects.toBeInstanceOf(SandboxTransportError);
   });
 
+  it("resumes a quiet output stream each time the runtime cuts it, past retry.maxAttempts", async () => {
+    vi.useFakeTimers();
+    let opened = 0;
+    // What Node's fetch does to a response that sends no bytes for 300s.
+    const cutWhenQuiet: typeof fetch = (input, init) => {
+      const url = requestUrl(input);
+      if (url.includes("/output")) {
+        opened++;
+        const last = opened === 6;
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            if (last) {
+              const exit = { type: "exit", state: "exited", exit_code: 0, timed_out: false };
+              controller.enqueue(new TextEncoder().encode(`${JSON.stringify(exit)}\n`));
+              controller.close();
+              return;
+            }
+            setTimeout(() => controller.error(new TypeError("terminated")), 300_000);
+          },
+        });
+        return Promise.resolve(
+          new Response(body, {
+            status: 200,
+            headers: { "content-type": "application/x-ndjson" },
+          }),
+        );
+      }
+      if (init?.method === "DELETE") return Promise.resolve(new Response(null, { status: 204 }));
+      const body = JSON.stringify({
+        id: url.slice(url.lastIndexOf("/") + 1),
+        state: "running",
+        spec: {},
+        created_at: "2026-01-01T00:00:00Z",
+        stdout: { total_bytes: 0, retained_from: 0, truncated: false },
+        stderr: { total_bytes: 0, retained_from: 0, truncated: false },
+      });
+      return Promise.resolve(new Response(body, { status: 201 }));
+    };
+    const quiet = client({ retry: { maxAttempts: 2 }, fetch: cutWhenQuiet });
+
+    const pending = quiet.exec({ shell: "sleep 1500", timeoutSeconds: 3_600 });
+    await vi.advanceTimersByTimeAsync(5 * 300_000 + 10_000);
+
+    await expect(pending).resolves.toMatchObject({ exit_code: 0, timed_out: false });
+    expect(opened).toBe(6);
+  });
+
   it("fails the start leg at the client's timeoutMs instead of waiting out the command", async () => {
     vi.useFakeTimers();
     const stalled = client({ timeoutMs: 1_000, retry: { maxAttempts: 1 }, fetch: stalledFetch });
@@ -602,7 +649,7 @@ describe("disks", () => {
     agent.entityJwts.set(ENTITY, JWT);
   });
 
-  it("attach is idempotent per entity: 201 then 200 with the same disk; list and detach", async () => {
+  it("attach is idempotent per entity: 201 then 200 with the same disk, and list returns it", async () => {
     const c = client();
     const first = await c.attachDisk({ entityId: ENTITY, entityJwt: JWT, mountPath: "/cache" });
     expect(first.created).toBe(true);
@@ -612,12 +659,6 @@ describe("disks", () => {
     const again = await c.attachDisk({ entityId: ENTITY, entityJwt: JWT, mountPath: "/cache" });
     expect(again).toEqual({ disk: first.disk, created: false });
     expect(await c.listDisks()).toEqual([first.disk]);
-
-    const detached = await c.detachDisk(2);
-    expect(detached.detached_at).toBeDefined();
-    expect(await c.detachDisk(2)).toEqual(detached);
-    expect(await c.listDisks()).toEqual([detached]);
-    await expect(c.detachDisk(3)).rejects.toMatchObject({ code: "not_found", status: 404 });
   });
 
   it("attaches a bare block device when no mount path is given", async () => {
@@ -641,23 +682,13 @@ describe("disks", () => {
     ).rejects.toMatchObject({ code: "conflict", status: 409 });
   });
 
-  it("rejects a slot outside 2..11 before sending anything", async () => {
-    const c = client();
-    for (const slot of [1, 12, 2.5, Number.NaN]) {
-      await expect(c.detachDisk(slot)).rejects.toBeInstanceOf(RangeError);
-    }
-    expect(agent.requests).toEqual([]);
-  });
-
-  it("attach and detach surface a lost response instead of replaying it", async () => {
+  it("attach surfaces a lost response instead of replaying it", async () => {
     const c = client();
     agent.faults.push("lost-response");
     await expect(c.attachDisk({ entityId: ENTITY, entityJwt: JWT })).rejects.toBeInstanceOf(
       SandboxTransportError,
     );
-    agent.faults.push("lost-response");
-    await expect(c.detachDisk(3)).rejects.toBeInstanceOf(SandboxTransportError);
-    expect(agent.requests.map((r) => r.method)).toEqual(["POST", "DELETE"]);
+    expect(agent.requests.map((r) => r.method)).toEqual(["POST"]);
   });
 
   it("gives attach longer than the client's per-request timeout", async () => {
