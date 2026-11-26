@@ -72,7 +72,7 @@ describe("Blacksmith", () => {
 
     const connected = await bs.sandboxes.connect(created.id, sandboxOptions());
 
-    expect((await connected.exec({ cmd: ["true"] })).exit_code).toBe(0);
+    expect((await connected.exec({ cmd: ["true"] })).exitCode).toBe(0);
     expect(cp.requests.filter((r) => r.path.endsWith("/tokens"))).toHaveLength(0);
   });
 
@@ -89,7 +89,7 @@ describe("Blacksmith", () => {
     expect(minted).toHaveLength(1);
     const printed = inspect(sandbox, { depth: null, showHidden: true }) + JSON.stringify(sandbox);
     expect(printed).not.toContain(minted[0]);
-    expect((await sandbox.exec({ cmd: ["true"] })).exit_code).toBe(0);
+    expect((await sandbox.exec({ cmd: ["true"] })).exitCode).toBe(0);
   });
 
   it("lists and deletes sandboxes, and snapshots a paused one", async () => {

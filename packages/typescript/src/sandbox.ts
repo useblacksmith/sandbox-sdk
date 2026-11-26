@@ -1,17 +1,14 @@
 import { SandboxError } from "./errors.js";
-import type {
-  ExecResponse,
-  FileInfo,
-  Health,
-  PortExposure,
-  Process,
-} from "./generated/types.gen.js";
 import type { SandboxFailure, SandboxRecord } from "./resources.js";
 import type {
+  ExecResult,
   FileContent,
+  FileInfo,
   FileStream,
   OutputChunk,
-  ProcessSpecInput,
+  PortExposure,
+  Process,
+  ProcessSpec,
   RequestOptions,
   StreamOutputOptions,
   StreamRequestOptions,
@@ -38,35 +35,9 @@ export class SandboxNotRunningError extends SandboxError {
   }
 }
 
-/** One wait inside an agent call for a pause → resume cycle the control plane reported. */
-export interface PauseResumeWait {
-  id: string;
-  /** The state the recheck found: `pausing`, `paused`, `resuming` or `starting`. */
-  from: string;
-  /** The state the wait ended on. */
-  state: string;
-  /**
-   * `running`: the call replays; `not_running`: the cycle settled in `paused` or a terminal
-   * state; `timeout`: it outlived `pauseResumeTimeoutMs`; `aborted`: the caller's signal fired;
-   * `failed`: a control-plane poll failed, so how the cycle went is unknown.
-   */
-  outcome: "running" | "not_running" | "timeout" | "aborted" | "failed";
-  waitedMs: number;
-}
-
 export interface SandboxOptions {
   /** How long `create`/`connect` wait for `GET /health` to succeed. Default 120s. */
   readyTimeoutMs?: number;
-  /**
-   * How long an agent call that finds the sandbox mid pause → resume cycle (`pausing`,
-   * `resuming`, `starting`) waits for `running` and a healthy agent before failing with
-   * `SandboxNotRunningError`. A cycle that settles in `paused` fails at once: only `resume()`
-   * brings it back. Default 30s, the cycle SLO: production pauses settle in p99 14s and
-   * resumes report running in p99 6.4s (2026-10).
-   */
-  pauseResumeTimeoutMs?: number;
-  /** Called once per wait with how it ended, so the caller can chart the cycle SLO. */
-  onPauseResumeWait?: (wait: PauseResumeWait) => void;
   /**
    * Sends this sandbox's requests to the sandbox itself, in place of the `fetch` given to
    * `Blacksmith`: for a proxy, tracing, custom TLS or a test. Requests to the Blacksmith
@@ -88,8 +59,20 @@ export interface Sandbox {
   readonly lastError: SandboxRecord["lastError"];
 
   refresh(): Promise<SandboxRecord>;
-  pause(): Promise<SandboxRecord>;
-  resume(): Promise<SandboxRecord>;
+  /**
+   * Resolves once the sandbox is `paused`, its boot disk kept. Throws `SandboxError` when it
+   * is not `paused` within `timeoutMs` (default 30s) or leaves the pause for another state.
+   * The last state read starts at `timeoutMs`, so the call settles up to one request after
+   * it, and a `paused` that read reports resolves the call.
+   */
+  pause(timeoutMs?: number): Promise<SandboxRecord>;
+  /**
+   * Resolves once the sandbox is `running` and answers `GET /health`, so the next call to it
+   * does not wait. Throws `SandboxNotRunningError` when it is not `running` within
+   * `timeoutMs` (default 30s), and `SandboxTransportError` when it is `running` but does not answer in time.
+   * The last state read starts at `timeoutMs`, as for `pause()`.
+   */
+  resume(timeoutMs?: number): Promise<SandboxRecord>;
   delete(): Promise<SandboxRecord>;
   /**
    * Asks the sandbox whether it is healthy, without re-checking its state: the caller
@@ -97,20 +80,20 @@ export interface Sandbox {
    * the sandbox, so some failures (a dropped connection, a `sandbox_paused` answer from
    * an old host) are retried before they are thrown.
    */
-  health(options?: RequestOptions): Promise<Health>;
+  health(options?: RequestOptions): Promise<void>;
 
   /**
    * Replay-safe: the process id is fixed before the first attempt and the process
    * stays in place after a transport failure, so the replay finds it and the
    * command runs once. The call's own deadline is final.
    */
-  exec(spec: ProcessSpecInput, options?: RequestOptions): Promise<ExecResponse>;
+  exec(spec: ProcessSpec, options?: RequestOptions): Promise<ExecResult>;
   /**
    * Starts a long-lived process and returns it; `Process.id` is what `streamOutput`,
    * `getProcess` and `killProcess` take, and `listProcesses` finds it again. Replay-safe
    * like `exec`: the command starts once however often the request is retried.
    */
-  startProcess(spec: ProcessSpecInput, options?: RequestOptions): Promise<Process>;
+  startProcess(spec: ProcessSpec, options?: RequestOptions): Promise<Process>;
   getProcess(id: string, options?: RequestOptions): Promise<Process>;
   listProcesses(options?: RequestOptions): Promise<Process[]>;
   killProcess(id: string, options?: RequestOptions): Promise<void>;

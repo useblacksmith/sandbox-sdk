@@ -8,8 +8,8 @@ import {
   SandboxTransportError,
 } from "../src/index.js";
 import { HttpControlPlaneClient, Sandbox } from "../src/internal/index.js";
-import type { SandboxAttachOptions } from "../src/internal/index.js";
-import type { OutputChunk, PauseResumeWait } from "../src/index.js";
+import type { PauseResumeWait, SandboxAttachOptions } from "../src/internal/index.js";
+import type { OutputChunk } from "../src/index.js";
 import { FakeAgent } from "./fake-agent.js";
 import { FakeControlPlane } from "./fake-control-plane.js";
 import { requestUrl } from "./request-url.js";
@@ -694,6 +694,117 @@ describe("tokens shared across handles", () => {
 });
 
 describe("lifecycle", () => {
+  describe("pause and resume wait for the sandbox to settle", () => {
+    const create = () =>
+      Sandbox.create(controlPlane, { image: "ubuntu-24.04", workload: "test" }, options);
+    beforeEach(() => {
+      cp.settleMs = 300;
+      return () => {
+        cp.settleMs = 0;
+      };
+    });
+
+    it("pause resolves with the paused record", async () => {
+      const sandbox = await create();
+      expect((await sandbox.pause()).state).toBe("paused");
+      expect(sandbox.state).toBe("paused");
+    });
+
+    it("resume resolves once the sandbox is running and the agent answers", async () => {
+      const sandbox = await create();
+      await sandbox.pause();
+      agent.requests.length = 0;
+      agent.faults.push("unavailable");
+      expect((await sandbox.resume()).state).toBe("running");
+      expect(agentPaths().filter((path) => path === "/v1/health")).toHaveLength(2);
+    });
+
+    it("pause fails when the sandbox is not paused within timeoutMs", async () => {
+      const sandbox = await create();
+      const error = await sandbox.pause(50).catch((e: unknown) => e);
+      expect(String(error)).toContain("is pausing, not paused: not settled within 50ms");
+      expect(sandbox.state).toBe("pausing");
+    });
+
+    it("resume fails with SandboxNotRunningError when not running within timeoutMs", async () => {
+      const sandbox = await create();
+      await sandbox.pause();
+      const error = await sandbox.resume(50).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(SandboxNotRunningError);
+      expect(error).toMatchObject({ id: sandbox.id, state: "resuming" });
+    });
+
+    it("resume does not wait for a state read that stalls after the agent fails its health check", async () => {
+      const sandbox = await create();
+      await sandbox.pause();
+      agent.faults.push(...Array<"unavailable">(40).fill("unavailable"));
+      const get = controlPlane.get.bind(controlPlane);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => (release = resolve));
+      let reads = 0;
+      const spy = vi.spyOn(controlPlane, "get").mockImplementation(async (id) => {
+        const result = await get(id);
+        if (++reads === 3) await held;
+        return result;
+      });
+      try {
+        const started = Date.now();
+        const error = await sandbox.resume(1_000).catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(SandboxTransportError);
+        expect(String(error)).toContain("not reachable within 1000ms");
+        expect(Date.now() - started).toBeLessThan(1_500);
+      } finally {
+        release();
+        spy.mockRestore();
+      }
+    });
+
+    it("resume keeps one cut-off when running is first read after timeoutMs", async () => {
+      const sandbox = await create();
+      await sandbox.pause();
+      agent.faults.push(...Array<"unavailable">(40).fill("unavailable"));
+      const get = controlPlane.get.bind(controlPlane);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => (release = resolve));
+      const started = Date.now();
+      let settled = false;
+      // The state is decided here, after the request, so the fake's own settle timer cannot flip
+      // it and a read that starts a moment before the cut-off sees `resuming` while time is left to
+      // poll again. `running` lands at a fixed 700ms, inside the 250ms the SDK allows past its
+      // 500ms cut-off however late the read started.
+      const spy = vi.spyOn(controlPlane, "get").mockImplementation(async (id) => {
+        if (settled) await held;
+        const record = await get(id);
+        if (Date.now() - started < 500) return { ...record, state: "resuming" };
+        await new Promise((resolve) => setTimeout(resolve, started + 700 - Date.now()));
+        settled = true;
+        return { ...record, state: "running" };
+      });
+      try {
+        const error = await sandbox.resume(500).catch((e: unknown) => e);
+        expect(error).toBeInstanceOf(SandboxTransportError);
+        expect(Date.now() - started).toBeLessThan(900);
+      } finally {
+        release();
+        spy.mockRestore();
+      }
+    });
+
+    it("fails at once when the sandbox leaves the transition for another state", async () => {
+      const sandbox = await create();
+      const pausing = sandbox.pause().catch((e: unknown) => e);
+      setTimeout(() => (cp.records.get(sandbox.id)!.status = "failed"), 50);
+      expect(String(await pausing)).toContain("is failed, not paused: it left the transition");
+    });
+
+    it("requestPause and requestResume resolve on acceptance", async () => {
+      const sandbox = await create();
+      expect((await sandbox.requestPause()).state).toBe("pausing");
+      await vi.waitFor(async () => expect((await sandbox.refresh()).state).toBe("paused"));
+      expect((await sandbox.requestResume()).state).toBe("resuming");
+    });
+  });
+
   it("pause, resume and delete update state", async () => {
     const sandbox = await Sandbox.create(
       controlPlane,
@@ -720,8 +831,8 @@ describe("ports", () => {
     agent.faults.push("reset", "reset", "reset");
 
     const exposure = await sandbox.exposePort(8080);
-    expect(exposure.hostname).toBe(
-      `port-8080-${exposure.rand}-${agent.sandboxId}.${agent.sandboxDomain}`,
+    expect(exposure.hostname).toMatch(
+      new RegExp(`^port-8080-[a-z]{8}-${agent.sandboxId}\\.${agent.sandboxDomain}$`),
     );
     expect(agentPaths().filter((p) => p === "/v1/ports/8080")).toHaveLength(4);
     expect(cpCalls()).toEqual([`GET /api/v1/sandboxes/${sandbox.id}`]);
@@ -755,7 +866,7 @@ describe("disks", () => {
     expect(cpCalls()).toEqual([`GET /api/v1/sandboxes/${sandbox.id}`]);
 
     const disk = await sandbox.attachDisk(input);
-    expect(disk).toMatchObject({ entity_id: 9, mount_path: "/home/blacksmith/.gradle" });
+    expect(disk).toMatchObject({ entityId: 9, mountPath: "/home/blacksmith/.gradle" });
 
     expect(await sandbox.listDisks()).toEqual([disk]);
   });
@@ -1543,6 +1654,6 @@ describe("Sandbox.health", () => {
 
     await expect(sandbox.health()).rejects.toMatchObject({ code: "sandbox_paused" });
     expect(cp.requests).toHaveLength(0);
-    expect(await sandbox.health()).toMatchObject({ status: "ok" });
+    await expect(sandbox.health()).resolves.toBeUndefined();
   });
 });

@@ -1,30 +1,35 @@
-import type {
-  Disk,
-  DiskList,
-  ExecResponse,
-  FileInfo,
-  Health,
-  PortExposure,
-  PortExposureList,
-  Process,
-  ProcessList,
-} from "../generated/types.gen.js";
 import { SandboxApiError, SandboxTransportError } from "../errors.js";
 import { isSandboxGone } from "./errors.js";
 import { parseNdjson } from "./ndjson.js";
 import { TokenSource, type TokenProvider } from "./token.js";
-import { toDiskAttachRequest, toOutputChunk, toProcessSpec } from "./wire.js";
+import {
+  decodeDisk,
+  decodeDiskList,
+  decodeFileInfo,
+  decodePortExposure,
+  decodePortExposureList,
+  decodeProcess,
+  decodeProcessList,
+  toDiskAttachRequest,
+  toOutputChunk,
+  toProcessSpec,
+} from "./wire.js";
 import type {
   AttachDiskResult,
+  Disk,
   DiskAttachInput,
+  ExecOptions,
+  ExecResult,
   ExposePortResult,
   FileContent,
+  FileInfo,
   FileMetadata,
   FileStream,
   OutputChunk,
   OutputExitChunk,
-  ExecOptions,
-  ProcessSpecInput,
+  PortExposure,
+  Process,
+  ProcessSpec,
   RequestOptions,
   StartProcessResult,
   StreamOutputOptions,
@@ -114,8 +119,8 @@ export class SandboxClient {
     };
   }
 
-  health(options?: RequestOptions): Promise<Health> {
-    return this.json<Health>({
+  async health(options?: RequestOptions): Promise<void> {
+    await this.send({
       method: "GET",
       path: "/health",
       idempotent: true,
@@ -133,7 +138,7 @@ export class SandboxClient {
    * call fails with a `SandboxTransportError`, the process is left in place, so
    * a replay under the same id finds it instead of starting the command again
    * (the agent reclaims it with the sandbox); such a replay reports
-   * `duration_ms` from the agent's timestamps. A generated id is never
+   * `durationMs` from the agent's timestamps. A generated id is never
    * replayed, so that process is always deleted, even when the start's outcome
    * is unknown; only a start the agent rejected leaves nothing to delete. An
    * omitted `timeoutSeconds`
@@ -142,7 +147,7 @@ export class SandboxClient {
    * `timeoutMs`; `timeoutSeconds: 0` leaves it unbounded. The deadline or the
    * caller's `signal` kills the process; that `DELETE` has its own short bound.
    */
-  async exec(spec: ProcessSpecInput, options: ExecOptions = {}): Promise<ExecResponse> {
+  async exec(spec: ProcessSpec, options: ExecOptions = {}): Promise<ExecResult> {
     const { processId, ...rest } = options;
     const id = processId ?? newExecProcessId();
     const timeoutSeconds = execTimeoutSeconds(spec.timeoutSeconds);
@@ -170,15 +175,13 @@ export class SandboxClient {
         });
       }
       return {
-        exit_code: output.exit.exitCode,
+        exitCode: output.exit.exitCode,
         signal: output.exit.signal,
         stdout: new TextDecoder().decode(output.stdout),
         stderr: new TextDecoder().decode(output.stderr),
         truncated: output.truncated,
-        timed_out: output.exit.timedOut,
-        duration_ms: start.created
-          ? Date.now() - called
-          : attachedDurationMs(start.process, called),
+        timedOut: output.exit.timedOut,
+        durationMs: start.created ? Date.now() - called : attachedDurationMs(start.process, called),
       };
     } catch (error) {
       if (deadline.signal.aborted && !isAbort(error, rest.signal)) {
@@ -219,7 +222,7 @@ export class SandboxClient {
 
   async startProcess(
     id: string,
-    spec: ProcessSpecInput,
+    spec: ProcessSpec,
     options?: RequestOptions,
   ): Promise<StartProcessResult> {
     const { response, body } = await this.send({
@@ -230,11 +233,11 @@ export class SandboxClient {
       idempotent: true,
       options,
     });
-    return { process: parseJson<Process>(body), created: response.status === 201 };
+    return { process: decodeProcess(body), created: response.status === 201 };
   }
 
   getProcess(id: string, options?: RequestOptions): Promise<Process> {
-    return this.json<Process>({
+    return this.json(decodeProcess, {
       method: "GET",
       path: `/processes/${encodeURIComponent(id)}`,
       idempotent: true,
@@ -242,14 +245,13 @@ export class SandboxClient {
     });
   }
 
-  async listProcesses(options?: RequestOptions): Promise<Process[]> {
-    const list = await this.json<ProcessList>({
+  listProcesses(options?: RequestOptions): Promise<Process[]> {
+    return this.json(decodeProcessList, {
       method: "GET",
       path: "/processes",
       idempotent: true,
       options,
     });
-    return list.processes;
   }
 
   /**
@@ -410,7 +412,7 @@ export class SandboxClient {
   writeFile(path: string, body: WriteFileBody, options: WriteFileOptions = {}): Promise<FileInfo> {
     const { mode, mkdirParents, ...request } = options;
     const bytes = typeof body === "string" ? new TextEncoder().encode(body) : body;
-    return this.json<FileInfo>({
+    return this.json(decodeFileInfo, {
       method: "PUT",
       path: "/fs/file",
       query: { path, mode: formatMode(mode), mkdir_parents: mkdirParents },
@@ -435,18 +437,17 @@ export class SandboxClient {
       idempotent: true,
       options,
     });
-    return { exposure: parseJson<PortExposure>(body), created: response.status === 201 };
+    return { exposure: decodePortExposure(body), created: response.status === 201 };
   }
 
   /** Exposed ports, ordered by port. */
-  async listPorts(options?: RequestOptions): Promise<PortExposure[]> {
-    const list = await this.json<PortExposureList>({
+  listPorts(options?: RequestOptions): Promise<PortExposure[]> {
+    return this.json(decodePortExposureList, {
       method: "GET",
       path: "/ports",
       idempotent: true,
       options,
     });
-    return list.ports;
   }
 
   /**
@@ -479,18 +480,17 @@ export class SandboxClient {
       idempotent: false,
       options: { ...options, timeoutMs: options?.timeoutMs ?? ATTACH_DISK_TIMEOUT_MS },
     });
-    return { disk: parseJson<Disk>(body), created: response.status === 201 };
+    return { disk: decodeDisk(body), created: response.status === 201 };
   }
 
   /** Disks attached to the current VM, detached ones included, ordered by slot. */
-  async listDisks(options?: RequestOptions): Promise<Disk[]> {
-    const list = await this.json<DiskList>({
+  listDisks(options?: RequestOptions): Promise<Disk[]> {
+    return this.json(decodeDiskList, {
       method: "GET",
       path: "/disks",
       idempotent: true,
       options,
     });
-    return list.disks;
   }
 
   /**
@@ -502,9 +502,9 @@ export class SandboxClient {
     this.redialNext = true;
   }
 
-  private async json<T>(op: Operation): Promise<T> {
+  private async json<T>(decode: (body: Uint8Array) => T, op: Operation): Promise<T> {
     const { body } = await this.send(op);
-    return parseJson<T>(body);
+    return decode(body);
   }
 
   /**
@@ -647,10 +647,6 @@ function buildHeaders(op: Operation, token: string): Headers {
   return headers;
 }
 
-function parseJson<T>(body: Uint8Array): T {
-  return JSON.parse(new TextDecoder().decode(body)) as T;
-}
-
 function fileMetadata(path: string, response: Response): FileMetadata {
   const size = response.headers.get("x-file-size");
   const lastModified = response.headers.get("last-modified");
@@ -686,9 +682,9 @@ function execTimeoutMs(timeoutSeconds: number, graceMs: number): number {
  * until now. Unparsable timestamps fall back to this call's own clock.
  */
 function attachedDurationMs(process: Process, called: number): number {
-  const started = Date.parse(process.started_at ?? process.created_at);
+  const started = (process.startedAt ?? process.createdAt).getTime();
   if (Number.isNaN(started)) return Date.now() - called;
-  const finished = process.finished_at === undefined ? Number.NaN : Date.parse(process.finished_at);
+  const finished = process.finishedAt?.getTime() ?? Number.NaN;
   return (Number.isNaN(finished) ? Date.now() : finished) - started;
 }
 

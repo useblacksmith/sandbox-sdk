@@ -55,9 +55,22 @@ export class FakeControlPlane {
   tokenTtlMs = 3_600_000;
   /** `false` mimics a backend whose create response carries no `token`. */
   tokenOnCreate = true;
+  /** How long a pause or resume stays in `pausing`/`resuming` before it settles. 0 settles in the response. */
+  settleMs = 0;
 
   private server: Server | undefined;
   private nextId = 1;
+
+  #transition(record: StoredSandbox, during: string, settled: string): void {
+    if (this.settleMs === 0) {
+      record.status = settled;
+      return;
+    }
+    record.status = during;
+    setTimeout(() => {
+      if (record.status === during) record.status = settled;
+    }, this.settleMs);
+  }
 
   get url(): string {
     if (!this.server) throw new Error("not started");
@@ -169,14 +182,14 @@ export class FakeControlPlane {
       if (record.status !== "running") {
         return sendInvalidState(res, `Cannot pause a ${record.status} sandbox`, record.status);
       }
-      record.status = "paused";
+      this.#transition(record, "pausing", "paused");
       return sendJson(res, 202, present(record));
     }
     if (action === "resume" && method === "POST") {
       if (record.status !== "paused") {
         return sendInvalidState(res, `Cannot resume a ${record.status} sandbox`, record.status);
       }
-      record.status = "running";
+      this.#transition(record, "resuming", "running");
       return sendJson(res, 202, present(record));
     }
     if (action === "tokens" && method === "POST") {

@@ -90,14 +90,22 @@ export interface SandboxCreateSettings {
   vcpu?: number;
   env?: Record<string, string>;
   labels?: string[];
+  /**
+   * Pause the sandbox after this long with no request to it and no process output. `resume()`
+   * brings it back. Default: it never pauses on its own.
+   */
   idleTimeoutSeconds?: number;
-  /** Retain paused/failed sandboxes for this long after last activity. Opt-in, not creation age. */
-  idleDeleteTimeoutSeconds?: number;
-  /** Absolute lifetime from creation, independent of activity and resume. */
+  /**
+   * Delete the sandbox this long after creation, whatever its state; activity and resume do
+   * not extend it. Default: it is never deleted on its own.
+   */
   ttlSeconds?: number;
+  /**
+   * Delete the sandbox once it is paused or failed and has been inactive for this long. Off by
+   * default.
+   */
+  idleDeleteTimeoutSeconds?: number;
   metadata?: Record<string, unknown>;
-  /** Ask the backend to block up to this long for the sandbox to reach `running`. */
-  waitSeconds?: number;
   /** Sent as `Idempotency-Key`; a replayed create returns the existing record. */
   idempotencyKey?: string;
 }
