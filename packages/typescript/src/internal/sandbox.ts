@@ -16,28 +16,24 @@ import {
 import type { SandboxCreateOptions, SandboxRecord } from "../resources.js";
 import {
   SandboxNotRunningError,
-  type PauseResumeWait,
   type Sandbox as PublicSandbox,
   type SandboxOptions,
 } from "../sandbox.js";
 import { isSandboxGone } from "./errors.js";
 import { sandboxTokens, type SandboxTokens, type SharedToken } from "./token-cache.js";
-import type {
-  Disk,
-  ExecResponse,
-  FileInfo,
-  Health,
-  PortExposure,
-  Process,
-} from "../generated/types.gen.js";
 import type { TokenProvider } from "./token.js";
 import type {
+  Disk,
   DiskAttachInput,
+  ExecOptions,
+  ExecResult,
   FileContent,
+  FileInfo,
   FileStream,
   OutputChunk,
-  ProcessSpecInput,
-  ExecOptions,
+  PortExposure,
+  Process,
+  ProcessSpec,
   RequestOptions,
   StartProcessOptions,
   StreamOutputOptions,
@@ -49,15 +45,43 @@ import type {
 /** A failure that warrants asking the control plane what the sandbox is doing. */
 type RecheckCause = SandboxTransportError | SandboxApiError;
 
+/** One wait inside an agent call for a pause → resume cycle the control plane reported. */
+export interface PauseResumeWait {
+  id: string;
+  /** The state the recheck found: `pausing`, `paused`, `resuming` or `starting`. */
+  from: string;
+  /** The state the wait ended on. */
+  state: string;
+  /**
+   * `running`: the call replays; `not_running`: the cycle settled in `paused` or a terminal
+   * state; `timeout`: it outlived `pauseResumeTimeoutMs`; `aborted`: the caller's signal fired;
+   * `failed`: a control-plane poll failed, so how the cycle went is unknown.
+   */
+  outcome: "running" | "not_running" | "timeout" | "aborted" | "failed";
+  waitedMs: number;
+}
+
 export interface SandboxAttachOptions extends SandboxOptions {
   /** Maps the minted hostname to the agent base URL. Default `https://<hostname>/v1`. */
   agentBaseUrl?: (hostname: string) => string;
   /** Retry tuning for this sandbox's requests to the sandbox itself. */
   retry?: RetryOptions;
+  /**
+   * How long an agent call that finds the sandbox mid pause → resume cycle (`pausing`,
+   * `resuming`, `starting`) waits for `running` and a healthy agent before failing with
+   * `SandboxNotRunningError`. A cycle that settles in `paused` fails at once: only `resume()`
+   * brings it back. Default 30s, the cycle SLO: production pauses settle in p99 14s and
+   * resumes report running in p99 6.4s (2026-10).
+   */
+  pauseResumeTimeoutMs?: number;
+  /** Called once per pause → resume wait with how it ended, so the caller can chart the cycle SLO. */
+  onPauseResumeWait?: (wait: PauseResumeWait) => void;
 }
 
 const DEFAULT_READY_TIMEOUT_MS = 120_000;
 const DEFAULT_PAUSE_RESUME_TIMEOUT_MS = 30_000;
+/** A pause or resume settles in seconds, so a longer poll gap would dominate what the caller waits. */
+const SETTLE_POLL_MAX_MS = 1_000;
 /**
  * How many times a call is replayed after a retired socket answered for a sandbox the
  * control plane says is running. Each such answer closes the connection that carried it,
@@ -94,7 +118,7 @@ export class Sandbox implements PublicSandbox {
     cp: SandboxControlPlane,
     record: SandboxRecord,
     client: SandboxClient,
-    options: SandboxOptions,
+    options: SandboxAttachOptions,
   ) {
     this.#cp = cp;
     this.id = record.id;
@@ -210,12 +234,57 @@ export class Sandbox implements PublicSandbox {
     return this.#record;
   }
 
-  async pause(): Promise<SandboxRecord> {
+  async pause(timeoutMs = DEFAULT_PAUSE_RESUME_TIMEOUT_MS): Promise<SandboxRecord> {
+    const cutoff = Date.now() + timeoutMs;
+    await this.requestPause();
+    await this.#settle("paused", ["pausing"], cutoff, timeoutMs);
+    return this.#record;
+  }
+
+  async resume(timeoutMs = DEFAULT_PAUSE_RESUME_TIMEOUT_MS): Promise<SandboxRecord> {
+    const cutoff = Date.now() + timeoutMs;
+    await this.requestResume();
+    await this.#settle("running", ["resuming", "starting"], cutoff, timeoutMs);
+    // The resume lands on another host as often as not; pooled connections point at the old one.
+    this.#client.redial();
+    // The same allowance #settle gives its last state read, so a stalled health check or state
+    // read cannot hold the call past it.
+    const timeout = new AbortController();
+    const timer = setTimeout(
+      () => timeout.abort(),
+      Math.max(0, cutoff + READY_POLL_BASE_MS - Date.now()),
+    );
+    try {
+      await this.#raceAbort(
+        this.#waitUntilReady(timeoutMs, timeout.signal, cutoff),
+        timeout.signal,
+      );
+    } catch (error) {
+      if (!timeout.signal.aborted) throw error;
+      throw new SandboxTransportError(
+        "GET",
+        `${this.#client.baseUrl}/health`,
+        1,
+        new Error(
+          `sandbox ${this.id} (${this.#record.state}) not reachable within ${timeoutMs}ms`,
+          { cause: error },
+        ),
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+    if (this.#record.state !== "running") throw new SandboxNotRunningError(this.#record);
+    return this.#record;
+  }
+
+  /** Resolves when the control plane accepts the pause, with the record still `pausing`. */
+  async requestPause(): Promise<SandboxRecord> {
     this.#record = await this.#cp.pause(this.id);
     return this.#record;
   }
 
-  async resume(): Promise<SandboxRecord> {
+  /** Resolves when the control plane accepts the resume, with the record still `resuming`. */
+  async requestResume(): Promise<SandboxRecord> {
     try {
       this.#record = await this.#cp.resume(this.id);
       return this.#record;
@@ -229,14 +298,54 @@ export class Sandbox implements PublicSandbox {
     }
   }
 
+  /**
+   * Polls the record until it reaches `target`. A state outside `passing` means something
+   * else changed the sandbox, so waiting longer would not reach `target`.
+   */
+  async #settle(
+    target: SandboxRecord["state"],
+    passing: readonly SandboxRecord["state"][],
+    deadline: number,
+    timeoutMs: number,
+  ): Promise<void> {
+    const unsettled = (reason: string) => {
+      const message = `sandbox ${this.id} is ${this.#record.state}, not ${target}: ${reason}`;
+      return target === "running"
+        ? new SandboxNotRunningError(this.#record, { cause: new SandboxError(message) })
+        : new SandboxError(message);
+    };
+    const timeout = new AbortController();
+    const timer = setTimeout(
+      () => timeout.abort(),
+      Math.max(0, deadline - Date.now()) + READY_POLL_BASE_MS,
+    );
+    try {
+      for (let attempt = 0; this.#record.state !== target; attempt++) {
+        if (!passing.includes(this.#record.state)) throw unsettled("it left the transition");
+        const left = deadline - Date.now();
+        if (left <= 0) throw unsettled(`not settled within ${timeoutMs}ms`);
+        const delay = Math.min(left, SETTLE_POLL_MAX_MS, READY_POLL_BASE_MS * 2 ** attempt);
+        try {
+          await sleep(delay, timeout.signal);
+          await this.#readRecord(timeout.signal);
+        } catch (error) {
+          if (timeout.signal.aborted) throw unsettled(`not settled within ${timeoutMs}ms`);
+          throw error;
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async delete(): Promise<SandboxRecord> {
     this.#record = await this.#cp.delete(this.id);
     return this.#record;
   }
 
-  async health(options?: RequestOptions): Promise<Health> {
+  async health(options?: RequestOptions): Promise<void> {
     try {
-      return await this.#client.health(options);
+      await this.#client.health(options);
     } catch (error) {
       // The socket that answered belongs to a VM the host no longer runs; the next call dials afresh.
       if (isSandboxGone(error)) this.#client.redial();
@@ -244,7 +353,7 @@ export class Sandbox implements PublicSandbox {
     }
   }
 
-  exec(spec: ProcessSpecInput, options: ExecOptions = {}): Promise<ExecResponse> {
+  exec(spec: ProcessSpec, options: ExecOptions = {}): Promise<ExecResult> {
     const processId = options.processId ?? newExecProcessId();
     return this.#withRecheck(() => this.#client.exec(spec, { ...options, processId }), {
       replay: (error) => !(error instanceof SandboxTransportError) || error.method !== "EXEC",
@@ -252,7 +361,7 @@ export class Sandbox implements PublicSandbox {
     });
   }
 
-  async startProcess(spec: ProcessSpecInput, options: StartProcessOptions = {}): Promise<Process> {
+  async startProcess(spec: ProcessSpec, options: StartProcessOptions = {}): Promise<Process> {
     const { processId = newProcessId(), ...request } = options;
     const { process } = await this.#withRecheck(
       () => this.#client.startProcess(processId, spec, request),

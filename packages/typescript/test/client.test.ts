@@ -87,13 +87,25 @@ describe("activity", () => {
         requests.push({ path, activity: new Headers(init?.headers).get("X-Sandbox-Activity") });
         return path.endsWith("/output")
           ? new Response('{"type":"stdout","offset":0,"data":"cmVhZHkK"}\n')
-          : Response.json({ id: "process-1", state: "running" });
+          : Response.json({
+              id: "process-1",
+              state: "running",
+              spec: { shell: "sleep 60", timeout_seconds: 90, not_in_the_public_type: true },
+              created_at: "2026-01-01T00:00:00Z",
+              stdout: { total_bytes: 0, retained_from: 0, truncated: false },
+              stderr: { total_bytes: 0, retained_from: 0, truncated: false },
+            });
       },
     });
-    expect(await c.getProcess("process-1", { activity: "active" })).toMatchObject({
+    const observed = await c.getProcess("process-1", { activity: "active" });
+    expect(observed).toMatchObject({
       id: "process-1",
       state: "running",
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      stdout: { totalBytes: 0, retainedFrom: 0, truncated: false },
     });
+    // A wire field the public type does not declare stays out of the result.
+    expect(observed.spec).toEqual({ shell: "sleep 60", timeoutSeconds: 90 });
     const chunks: OutputChunk[] = [];
     for await (const chunk of c.streamOutput("process-1", { activity: "active" }))
       chunks.push(chunk);
@@ -113,7 +125,7 @@ describe("activity", () => {
 
 describe("auth", () => {
   it("sends the configured token to /health", async () => {
-    await expect(client().health()).resolves.toEqual({ status: "ok" });
+    await expect(client().health()).resolves.toBeUndefined();
     expect(agent.requests[0]?.authorization).toBe(`Bearer ${TOKEN}`);
   });
 
@@ -125,7 +137,7 @@ describe("auth", () => {
         expiresAt: new Date(Date.now() + 3_600_000),
       }),
     });
-    await expect(c.health()).resolves.toEqual({ status: "ok" });
+    await expect(c.health()).resolves.toBeUndefined();
     expect(agent.requests[0]?.authorization).toBe(`Bearer ${TOKEN}`);
   });
 
@@ -204,13 +216,13 @@ describe("auth", () => {
 });
 
 describe("exec", () => {
-  it("runs a shell command and returns the wire response", async () => {
+  it("runs a shell command and returns the result in camelCase", async () => {
     const result = await client().exec({ shell: "echo out; echo err >&2; exit 3" });
     expect(result).toMatchObject({
-      exit_code: 3,
+      exitCode: 3,
       stdout: "out\n",
       stderr: "err\n",
-      timed_out: false,
+      timedOut: false,
     });
   });
 
@@ -223,9 +235,9 @@ describe("exec", () => {
     expect(result.stdout).toBe("/\nbar\n");
   });
 
-  it("reports timed_out when the command is cut off", async () => {
+  it("reports timedOut when the command is cut off", async () => {
     const result = await client().exec({ shell: "echo partial; sleep 30", timeoutSeconds: 1 });
-    expect(result.timed_out).toBe(true);
+    expect(result.timedOut).toBe(true);
     expect(result.signal).toBe("SIGKILL");
     expect(result.stdout).toBe("partial\n");
   });
@@ -253,7 +265,7 @@ describe("exec", () => {
   it("retries a connection the agent closed before answering, under the same id", async () => {
     agent.faults.push("reset");
     const result = await client().exec({ shell: "echo once" });
-    expect(result).toMatchObject({ exit_code: 0, stdout: "once\n" });
+    expect(result).toMatchObject({ exitCode: 0, stdout: "once\n" });
     const puts = putsFor();
     expect(puts).toHaveLength(2);
     expect(puts[0]).toBe(puts[1]);
@@ -263,7 +275,7 @@ describe("exec", () => {
     const marker = join(agent.fsRoot, "ran");
     agent.faults.push("lost-response");
     const result = await client().exec({ shell: `echo run >> ${marker}; cat ${marker}` });
-    expect(result).toMatchObject({ exit_code: 0, stdout: "run\n" });
+    expect(result).toMatchObject({ exitCode: 0, stdout: "run\n" });
     expect(putsFor()).toHaveLength(2);
     expect(await fsReadFile(marker, "utf8")).toBe("run\n");
   });
@@ -271,7 +283,7 @@ describe("exec", () => {
   it("resumes the output stream by offset after a mid-stream cut", async () => {
     agent.faults.push("pass", "cut-stream");
     const result = await client().exec({ shell: "echo first; sleep 0.2; echo second" });
-    expect(result).toMatchObject({ exit_code: 0, stdout: "first\nsecond\n", truncated: false });
+    expect(result).toMatchObject({ exitCode: 0, stdout: "first\nsecond\n", truncated: false });
     const outputs = agent.requests.filter((r) => r.path.includes("/output"));
     expect(outputs).toHaveLength(2);
     expect(outputs[1]!.path).toContain("stdout_from=6");
@@ -298,7 +310,7 @@ describe("exec", () => {
     expect(agent.requests.filter((r) => r.method === "DELETE")).toHaveLength(0);
 
     const result = await c.exec(spec, { processId: "replayed" });
-    expect(result).toMatchObject({ exit_code: 0, stdout: `${"tick\n".repeat(10)}run\n` });
+    expect(result).toMatchObject({ exitCode: 0, stdout: `${"tick\n".repeat(10)}run\n` });
     expect(await fsReadFile(marker, "utf8")).toBe("run\n");
     expect(agent.requests.filter((r) => r.method === "DELETE")).toHaveLength(1);
   });
@@ -366,8 +378,8 @@ describe("exec", () => {
     await vi.waitFor(async () => expect((await c.getProcess("finished")).state).toBe("exited"));
     await new Promise((resolve) => setTimeout(resolve, 300));
     const result = await c.exec({ shell: "true" }, { processId: "finished" });
-    expect(result).toMatchObject({ exit_code: 0 });
-    expect(result.duration_ms).toBeLessThan(300);
+    expect(result).toMatchObject({ exitCode: 0 });
+    expect(result.durationMs).toBeLessThan(300);
   });
 
   it("reads a timeoutSeconds above the agent's maximum as unlimited, like /exec", async () => {
@@ -386,7 +398,7 @@ describe("exec", () => {
     const router = await new FakeRouter(agent.url, 1).start();
     try {
       const result = await client({ baseUrl: router.url }).exec({ shell: "echo routed" });
-      expect(result).toMatchObject({ exit_code: 0, stdout: "routed\n" });
+      expect(result).toMatchObject({ exitCode: 0, stdout: "routed\n" });
       expect(putsFor()).toHaveLength(1);
     } finally {
       await router.stop();
@@ -395,7 +407,7 @@ describe("exec", () => {
 
   it("outlives the client's per-request timeout while the command runs", async () => {
     const result = await client({ timeoutMs: 50 }).exec({ shell: "sleep 0.3" });
-    expect(result).toMatchObject({ exit_code: 0, timed_out: false });
+    expect(result).toMatchObject({ exitCode: 0, timedOut: false });
   });
 
   it("bounds the whole call by timeoutSeconds (agent default 300s) plus timeoutMs", async () => {
@@ -503,7 +515,7 @@ describe("exec", () => {
     const pending = quiet.exec({ shell: "sleep 1500", timeoutSeconds: 3_600 });
     await vi.advanceTimersByTimeAsync(5 * 300_000 + 10_000);
 
-    await expect(pending).resolves.toMatchObject({ exit_code: 0, timed_out: false });
+    await expect(pending).resolves.toMatchObject({ exitCode: 0, timedOut: false });
     expect(opened).toBe(6);
   });
 
@@ -571,6 +583,62 @@ describe("processes", () => {
   });
 });
 
+describe("agent bodies that depart from the spec", () => {
+  const stats = { total_bytes: 0, retained_from: 0, truncated: false };
+  const process = {
+    id: "process-1",
+    state: "running",
+    spec: { shell: "sleep 60" },
+    created_at: "2026-01-01T00:00:00.123456789+02:00",
+    stdout: stats,
+    stderr: stats,
+  };
+  const answering = (body: unknown) => client({ fetch: async () => Response.json(body) });
+
+  it("accepts a timestamp with nanoseconds and an offset", async () => {
+    const got = await answering(process).getProcess("process-1");
+    expect(got.createdAt).toEqual(new Date("2026-01-01T00:00:00.123+02:00"));
+  });
+
+  it.each([
+    ["a process without spec", "getProcess", { ...process, spec: undefined }, "process"],
+    ["a process without stdout stats", "getProcess", { ...process, stdout: undefined }, "process"],
+    ["a process in an unknown state", "getProcess", { ...process, state: "paused" }, "process"],
+    ["a bad process timestamp", "getProcess", { ...process, created_at: "soon" }, "process"],
+    [
+      "a bad timestamp in a list",
+      "listProcesses",
+      { processes: [{ ...process, started_at: 7 }] },
+      "process list",
+    ],
+    ["a port list that is not a list", "listPorts", { ports: {} }, "port exposure list"],
+    [
+      "a disk with a non-numeric capacity",
+      "listDisks",
+      {
+        disks: [
+          {
+            slot: 2,
+            device: "/dev/vdc",
+            entity_id: 1,
+            capacity_gb: "50",
+            attached_at: "2026-01-01T00:00:00Z",
+          },
+        ],
+      },
+      "disk list",
+    ],
+  ] as const)("rejects %s", async (_name, method, body, what) => {
+    const error = await answering(body)
+      [method]("process-1")
+      .catch((e: unknown) => e);
+    expect(error).toMatchObject({
+      name: "SandboxError",
+      message: `malformed ${what} response from the sandbox agent`,
+    });
+  });
+});
+
 describe("ports", () => {
   it("expose is idempotent: 201 then 200 with the same hostname; list and unexpose", async () => {
     const c = client();
@@ -578,11 +646,13 @@ describe("ports", () => {
     expect(first.created).toBe(true);
     expect(first.exposure).toMatchObject({
       port: 8080,
-      rand: expect.stringMatching(/^[a-z]{8}$/) as string,
-      hostname: `port-8080-${first.exposure.rand}-${agent.sandboxId}.${agent.sandboxDomain}`,
-      url: `https://port-8080-${first.exposure.rand}-${agent.sandboxId}.${agent.sandboxDomain}`,
+      hostname: expect.stringMatching(
+        new RegExp(`^port-8080-[a-z]{8}-${agent.sandboxId}\\.${agent.sandboxDomain}$`),
+      ) as string,
+      url: `https://${first.exposure.hostname}`,
     });
-    expect(Date.parse(first.exposure.created_at)).not.toBeNaN();
+    expect(first.exposure).not.toHaveProperty("rand");
+    expect(first.exposure.createdAt.getTime()).not.toBeNaN();
 
     const again = await c.exposePort(8080);
     expect(again.created).toBe(false);
@@ -653,7 +723,7 @@ describe("disks", () => {
     const c = client();
     const first = await c.attachDisk({ entityId: ENTITY, entityJwt: JWT, mountPath: "/cache" });
     expect(first.created).toBe(true);
-    expect(first.disk).toMatchObject({ slot: 2, entity_id: ENTITY, mount_path: "/cache" });
+    expect(first.disk).toMatchObject({ slot: 2, entityId: ENTITY, mountPath: "/cache" });
     expect(JSON.stringify(first.disk)).not.toContain(JWT);
 
     const again = await c.attachDisk({ entityId: ENTITY, entityJwt: JWT, mountPath: "/cache" });
@@ -663,7 +733,7 @@ describe("disks", () => {
 
   it("attaches a bare block device when no mount path is given", async () => {
     const { disk } = await client().attachDisk({ entityId: ENTITY, entityJwt: JWT });
-    expect(disk.mount_path).toBeUndefined();
+    expect(disk.mountPath).toBeUndefined();
   });
 
   it("surfaces the host's forbidden, not_found and conflict errors", async () => {
@@ -878,6 +948,25 @@ describe("files", () => {
     expect(read.requestId).toBeTruthy();
   });
 
+  it("returns only the fields FileInfo declares", async () => {
+    const c = client({
+      fetch: async () =>
+        Response.json({
+          path: "/a.txt",
+          size: 1,
+          mode: "0644",
+          mod_time: "2026-01-01T00:00:00Z",
+          not_in_the_public_type: true,
+        }),
+    });
+    expect(await c.writeFile("/a.txt", "x")).toEqual({
+      path: "/a.txt",
+      size: 1,
+      mode: "0644",
+      lastModified: new Date("2026-01-01T00:00:00Z"),
+    });
+  });
+
   it("encodes a numeric mode below 0o100 with three octal digits", async () => {
     const info = await client().writeFile("/locked.txt", "x", { mode: 0o040 });
     expect(info.mode).toBe("0040");
@@ -998,7 +1087,7 @@ describe("errors and retries", () => {
         return fetch(input, init);
       },
     });
-    await expect(c.health()).resolves.toEqual({ status: "ok" });
+    await expect(c.health()).resolves.toBeUndefined();
     expect(requests).toEqual([
       { url: `${agent.url}/health`, keepalive: undefined },
       { url: `${agent.url}/health`, keepalive: false },
@@ -1037,7 +1126,7 @@ describe("errors and retries", () => {
         return fetch(input, init);
       },
     });
-    await expect(c.health()).resolves.toEqual({ status: "ok" });
+    await expect(c.health()).resolves.toBeUndefined();
     expect(requests).toEqual([
       { url: `${agent.url}/health`, keepalive: undefined, authorization: `Bearer ${TOKEN}` },
       { url: `${agent.url}/health`, keepalive: false, authorization: `Bearer ${TOKEN}` },
@@ -1053,8 +1142,8 @@ describe("errors and retries", () => {
       },
     });
     c.redial();
-    await expect(c.health()).resolves.toEqual({ status: "ok" });
-    await expect(c.health()).resolves.toEqual({ status: "ok" });
+    await expect(c.health()).resolves.toBeUndefined();
+    await expect(c.health()).resolves.toBeUndefined();
     expect(keepalives).toEqual([false, undefined]);
   });
 
@@ -1199,7 +1288,7 @@ describe("errors and retries", () => {
 
   it("retries idempotent GETs with backoff and succeeds", async () => {
     agent.faults.push("reset", "reset");
-    await expect(client().health()).resolves.toEqual({ status: "ok" });
+    await expect(client().health()).resolves.toBeUndefined();
     expect(agent.requests).toHaveLength(3);
   });
 
@@ -1238,7 +1327,7 @@ describe("errors and retries", () => {
   it("keeps retry defaults for fields passed as undefined", async () => {
     agent.faults.push("reset", "reset");
     const c = client({ retry: { maxAttempts: undefined, baseDelayMs: 1, maxDelayMs: undefined } });
-    await expect(c.health()).resolves.toEqual({ status: "ok" });
+    await expect(c.health()).resolves.toBeUndefined();
     expect(agent.requests).toHaveLength(3);
   });
 

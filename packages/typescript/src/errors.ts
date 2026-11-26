@@ -1,4 +1,24 @@
-import type { ErrorBody, ErrorCode } from "./generated/types.gen.js";
+/** The agent's error codes, as it sends them. */
+export type ErrorCode =
+  | "unauthorized"
+  | "token_expired"
+  | "forbidden"
+  | "not_found"
+  | "conflict"
+  | "invalid_argument"
+  | "timeout"
+  | "unavailable"
+  | "sandbox_failed"
+  | "sandbox_paused"
+  | "sandbox_deleted"
+  | "insufficient_storage"
+  | "internal";
+
+interface ErrorBody {
+  code: ErrorCode;
+  message: string;
+  details?: Record<string, unknown>;
+}
 
 /** Base class for every error thrown by this SDK. */
 export class SandboxError extends Error {
@@ -14,6 +34,7 @@ export class SandboxError extends Error {
  */
 export class SandboxApiError extends SandboxError {
   readonly code: ErrorCode;
+  /** Passed through as the agent sent it, so its keys stay snake_case (e.g. `existing_spec`). */
   readonly details: Record<string, unknown> | undefined;
   readonly status: number;
   readonly requestId: string | undefined;

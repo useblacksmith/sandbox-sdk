@@ -1,14 +1,5 @@
-import type {
-  Disk,
-  FileInfo,
-  PortExposure,
-  Process,
-  ProcessSpec,
-  ProcessState,
-} from "./generated/types.gen.js";
-
-/** camelCase mirror of the wire `ProcessSpec`; exactly one of `cmd` / `shell`. */
-export interface ProcessSpecInput {
+/** Exactly one of `cmd` / `shell`. */
+export interface ProcessSpec {
   cmd?: string[];
   shell?: string;
   cwd?: string;
@@ -58,11 +49,10 @@ export interface StartProcessResult {
 
 export interface ExposePortResult {
   exposure: PortExposure;
-  /** `true` for 201 (exposed now), `false` for 200 (already exposed; same `hostname` and `rand`). */
+  /** `true` for 201 (exposed now), `false` for 200 (already exposed; same `hostname`). */
   created: boolean;
 }
 
-/** camelCase mirror of the wire `DiskAttachRequest`. */
 export interface DiskAttachInput {
   entityId: number;
   /** Storage-agent JWT scoped to `entityId`, minted by the control plane. */
@@ -137,4 +127,85 @@ export interface WriteFileOptions extends RequestOptions {
   mkdirParents?: boolean;
 }
 
-export type { FileInfo, PortExposure, Process, ProcessSpec, ProcessState };
+/**
+ * `running`: started and not yet exited. `exited`: finished (see `exitCode` / `signal`).
+ * `killed`: terminated by the sandbox host (timeout or `killProcess`). `lost`: the host lost
+ * track of the process and its status is unknown.
+ */
+export type ProcessState = "running" | "exited" | "killed" | "lost";
+
+export interface ProcessOutputStats {
+  /** Bytes produced so far; also the next offset. */
+  totalBytes: number;
+  /** Oldest offset still readable. */
+  retainedFrom: number;
+  /** `true` once bytes have been evicted (`retainedFrom > 0`). */
+  truncated: boolean;
+}
+
+export interface Process {
+  id: string;
+  state: ProcessState;
+  spec: ProcessSpec;
+  /** Pid inside the sandbox. */
+  pid?: number;
+  /** Present when `state` is `exited` or `killed`. 128+signal when signaled. */
+  exitCode?: number;
+  /** Terminating signal name (e.g. `SIGKILL`) when the process was signaled. */
+  signal?: string;
+  /** `true` when the process was killed for exceeding `timeoutSeconds`. */
+  timedOut?: boolean;
+  createdAt: Date;
+  startedAt?: Date;
+  finishedAt?: Date;
+  stdout: ProcessOutputStats;
+  stderr: ProcessOutputStats;
+}
+
+export interface ExecResult {
+  /**
+   * Absent only when `timedOut` is true and the process had not yet been seen to exit:
+   * the kill is under way but its exit status is unknown. 128+signal when signaled.
+   */
+  exitCode?: number;
+  signal?: string;
+  stdout: string;
+  stderr: string;
+  /** `true` if either stream lost bytes to the output buffer limit. */
+  truncated: boolean;
+  timedOut: boolean;
+  durationMs: number;
+}
+
+export interface PortExposure {
+  /** Guest TCP port. */
+  port: number;
+  hostname: string;
+  /** `https://<hostname>`. */
+  url: string;
+  createdAt: Date;
+}
+
+export interface FileInfo {
+  /** Absolute path inside the sandbox, as requested. */
+  path: string;
+  size: number;
+  /** Octal permission bits, e.g. `"0644"`. */
+  mode: string;
+  lastModified: Date;
+}
+
+export interface Disk {
+  /** Drive slot serving the entity, 2..11. */
+  slot: number;
+  /** Block device inside the sandbox, `/dev/vdX`. */
+  device: string;
+  entityId: number;
+  /** Size the guest sees. */
+  capacityGb: number;
+  attachedAt: Date;
+  /** Set once the disk was detached. */
+  detachedAt?: Date;
+  /** Where the disk is mounted inside the sandbox, if it is. */
+  mountPath?: string;
+}

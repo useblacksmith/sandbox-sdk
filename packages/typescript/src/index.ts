@@ -7,7 +7,7 @@ export {
   SandboxTransportError,
   concurrencyLimit,
 } from "./errors.js";
-export type { ConcurrencyLimit } from "./errors.js";
+export type { ConcurrencyLimit, ErrorCode } from "./errors.js";
 export type {
   ImageSnapshotCreateOptions,
   ImageSnapshotListOptions,
@@ -22,20 +22,25 @@ export type {
   Snapshots,
 } from "./resources.js";
 export { SandboxNotRunningError } from "./sandbox.js";
-export type { PauseResumeWait, Sandbox, SandboxOptions } from "./sandbox.js";
+export type { Sandbox, SandboxOptions } from "./sandbox.js";
 export type {
+  ExecResult,
   FileContent,
+  FileInfo,
   FileMetadata,
   FileStream,
   OutputChunk,
   OutputDataChunk,
   OutputExitChunk,
   OutputGapChunk,
-  ProcessSpecInput,
+  PortExposure,
+  Process,
+  ProcessOutputStats,
+  ProcessSpec,
+  ProcessState,
   RequestOptions,
   StreamOutputOptions,
   StreamRequestOptions,
   WriteFileBody,
   WriteFileOptions,
 } from "./types.js";
-export type * from "./generated/types.gen.js";

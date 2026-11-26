@@ -336,7 +336,6 @@ function toCreateBody(options: SandboxCreateOptions): Record<string, unknown> {
     body.idle_delete_timeout_seconds = options.idleDeleteTimeoutSeconds;
   if (options.ttlSeconds !== undefined) body.ttl_seconds = options.ttlSeconds;
   if (options.metadata !== undefined) body.metadata = options.metadata;
-  if (options.waitSeconds !== undefined) body.wait = options.waitSeconds;
   return body;
 }
 

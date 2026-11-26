@@ -18,8 +18,8 @@ import { Blacksmith } from "@useblacksmith/sandbox";
 const bs = new Blacksmith(); // reads BLACKSMITH_API_KEY; or new Blacksmith({ apiKey })
 const sandbox = await bs.sandboxes.create({ image: "ubuntu24", workload: "ci-repro" });
 
-const { exit_code, timed_out, stdout } = await sandbox.exec({ cmd: ["uname", "-a"] });
-console.log(timed_out ? "timed out" : exit_code, stdout);
+const { exitCode, timedOut, stdout } = await sandbox.exec({ cmd: ["uname", "-a"] });
+console.log(timedOut ? "timed out" : exitCode, stdout);
 
 await sandbox.writeFile(
   "/work/build.sh",
@@ -65,6 +65,30 @@ a `TypeError` for a value that breaks these rules before any request is sent. Th
 them as `workload` and `tenant`. Anything that differs per sandbox (a session
 id, a branch) belongs in `labels`.
 
+## Lifetime
+
+Three create options bound how long a sandbox lives. All are off by default, so
+a sandbox created without them runs until you delete it.
+
+- `idleTimeoutSeconds` (60 to 604800): pause the sandbox after this long with
+  no request to it and no process output. Pausing keeps the boot disk and does
+  not delete the sandbox; `resume()` brings it back.
+- `ttlSeconds` (60 to 2592000): delete the sandbox this long after creation,
+  whatever its state. Activity and resume do not extend it.
+- `idleDeleteTimeoutSeconds` (3600 to 2592000): delete the sandbox once it is
+  paused or failed and this long has passed since its last activity. It never
+  deletes a running sandbox, so pair it with `idleTimeoutSeconds`.
+
+```ts
+await bs.sandboxes.create({
+  image: "ubuntu24",
+  workload: "agent-session",
+  idleTimeoutSeconds: 15 * 60,
+  idleDeleteTimeoutSeconds: 24 * 60 * 60,
+  ttlSeconds: 7 * 24 * 60 * 60,
+});
+```
+
 ## Exposed ports
 
 `exposePort(port)` gives a guest TCP port a public hostname,
@@ -85,7 +109,7 @@ await sandbox.unexposePort(8080);
 ```
 
 `exposePort` is idempotent: a later call for the same port returns the same
-`hostname`, `rand` and `created_at`. Nothing checks that
+`hostname` and `createdAt`. Nothing checks that
 the port is listening; the hostname answers 502 until it is. The agent refuses
 its own shim port (`invalid_argument`) and more than 32 exposures (`conflict`);
 `unexposePort` on a port that is not exposed is `not_found`. Exposures are
@@ -101,12 +125,7 @@ time (7 days by default) so new sandboxes can start from it. The source must be
 `paused`, and a sandbox created from a snapshot cannot itself be snapshotted.
 
 ```ts
-// pause() returns once the request is accepted; the snapshot needs the boot disk persisted.
-let { state } = await sandbox.pause();
-while (state === "pausing") {
-  await new Promise((resolve) => setTimeout(resolve, 1_000));
-  ({ state } = await sandbox.refresh());
-}
+await sandbox.pause(); // resolves once the boot disk is kept
 const snapshot = await bs.snapshots.create({ sandbox: sandbox.id, ttlSeconds: 86_400 });
 
 const child = await bs.sandboxes.create({ image: snapshot.id, workload: "ci-repro" });
@@ -192,7 +211,11 @@ transport error it asks the API for the sandbox's state; if the sandbox is not `
 `SandboxNotRunningError`, otherwise the call is retried once (and
 `streamOutput` resumes from the last delivered byte offsets; `exec` keeps its
 process id). `connect` on a `paused` sandbox returns without
-waiting for the agent; call `resume()` before using it. `create`/`connect` on a
+waiting for the agent; call `resume()` before using it. `pause()` resolves once
+the sandbox is `paused` and `resume()` once it is `running` and answers; each
+takes an optional `timeoutMs` and waits 30s by default. The last state read
+starts at `timeoutMs`, so a call settles up to one request after it and returns
+the target state if that read reports it. `create`/`connect` on a
 `deleting`, `deleted` or `failed` sandbox throws `SandboxNotRunningError` right
 away instead of waiting for an agent that will never answer.
 
@@ -247,6 +270,25 @@ there is an interface in `src/sandbox.ts`, which the class in
 The agent HTTP API is defined by `FastActions/fa` at
 `agent/sandboxapi/openapi.yaml`. This package vendors that spec under `spec/`
 and generates types into `src/generated/`.
+
+The generated types describe the wire and stay private. The types callers see
+are handwritten in `src/types.ts` and `src/errors.ts`, in camelCase with `Date`
+timestamps, so a spec or generator change cannot rename a public type. Two rules
+keep it that way, and `test/entry.test.ts` checks both:
+
+- No file outside `src/internal/` and `test/` imports or exports a generated type.
+- A file under `src/internal/` imports a generated type only to read agent JSON
+  or write a request body. Today that is `src/internal/wire.ts` alone, which
+  converts between the two shapes. Each imported name is listed in the test, so
+  adding one is a reviewed change.
+
+`wire.ts` parses each agent JSON body with a handwritten zod schema before
+converting it, so a body that departs from the spec throws a `SandboxError`
+naming the response, with the zod error as its `cause`.
+
+After a spec bump, a field the spec renames or removes fails the type check in
+`wire.ts`. A field the spec adds reaches callers once it is added to the
+handwritten type and its converter.
 
 ## Development
 
