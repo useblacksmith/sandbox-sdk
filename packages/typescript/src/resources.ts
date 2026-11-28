@@ -105,7 +105,6 @@ export interface SandboxCreateSettings {
    * default.
    */
   idleDeleteTimeoutSeconds?: number;
-  metadata?: Record<string, unknown>;
   /** Sent as `Idempotency-Key`; a replayed create returns the existing record. */
   idempotencyKey?: string;
 }
